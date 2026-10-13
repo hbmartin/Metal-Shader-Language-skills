@@ -1,0 +1,3 @@
+interface:
+  display_name: "Metal Shader Authoring"
+  short_description: "MSL interfaces, precision, and shader compilation"

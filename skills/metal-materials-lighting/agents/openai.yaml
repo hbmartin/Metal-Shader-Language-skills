@@ -1,0 +1,3 @@
+interface:
+  display_name: "Metal Materials and Lighting"
+  short_description: "Shape MSL materials, lighting, normals, and HDR color"

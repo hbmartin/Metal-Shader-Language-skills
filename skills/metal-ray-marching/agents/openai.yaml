@@ -1,0 +1,3 @@
+interface:
+  display_name: "Metal Ray Marching"
+  short_description: "MSL distance fields, surface tracing, and volumes"
