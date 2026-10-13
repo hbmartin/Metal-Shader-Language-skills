@@ -1,0 +1,3 @@
+interface:
+  display_name: "Metal Compute"
+  short_description: "Compute effects, reductions, and race-free simulations"
