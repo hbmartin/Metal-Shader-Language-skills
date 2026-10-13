@@ -8,7 +8,7 @@ Use elapsed seconds relative to a nearby origin. Casting an epoch-sized timestam
 
 For an implicit edge, soften coverage using the screen-space footprint of its distance value. For repeated stripes, low-pass the oscillation when its phase changes substantially across a pixel. Do not call fragment derivatives in nonuniform control flow and assume useful results; measure the footprint beforehand. `dfdx`, `dfdy`, and `fwidth` are fragment-stage tools; a compute kernel needs passed-in scale/Jacobian information.
 
-This complete translation unit contains a distance-coverage helper and a runnable fragment example. The stripe filter integrates a locally linear phase over a square pixel; it is an approximation when the phase curves strongly within that pixel. The host binds the `PEPatternParams` struct at fragment buffer 0 with its MSL layout and a positive pixel resolution. The vertex stage only needs to provide `[[position]]`.
+This complete translation unit contains a distance-coverage helper and a runnable fragment example. `pe_filtered_stripe` integrates a locally linear phase over a square pixel; it is an approximation when the phase curves strongly within that pixel. Its sinc response has signed sidelobes, so contrast can return inverted above one cycle per pixel. `pe_bandlimited_stripe` adds a practical contrast fade from 0.25 to 0.5 cycles per pixel, using the largest absolute phase-gradient component, and returns gray at or above 0.5. The fragment uses this suppression policy; it is not exact box integration or an ideal reconstruction filter. The host binds the `PEPatternParams` struct at fragment buffer 0 with its MSL layout and a positive pixel resolution. The vertex stage only needs to provide `[[position]]`.
 
 ```metal
 #include <metal_stdlib>
@@ -29,6 +29,13 @@ float pe_filtered_stripe(float phase, float2 phaseGradient) {
     return 0.5f + 0.5f * sin(phase) * attenuation;
 }
 
+float pe_bandlimited_stripe(float phase, float2 phaseGradient) {
+    float cyclesPerPixel = max(abs(phaseGradient.x), abs(phaseGradient.y)) /
+                           6.28318530718f;
+    float visibility = 1.0f - smoothstep(0.25f, 0.5f, cyclesPerPixel);
+    return 0.5f + (pe_filtered_stripe(phase, phaseGradient) - 0.5f) * visibility;
+}
+
 struct PEPatternParams {
     float2 resolution;
     float elapsedSeconds;
@@ -44,7 +51,7 @@ fragment half4 pe_stripe_fragment(
     float phase = 6.28318530718f *
                   (p.x * params.cyclesPerUnit - params.elapsedSeconds * 0.1f);
     float2 gradient = float2(dfdx(phase), dfdy(phase));
-    float value = pe_filtered_stripe(phase, gradient);
+    float value = pe_bandlimited_stripe(phase, gradient);
     return half4(half3(value), 1.0h);
 }
 ```
@@ -57,3 +64,5 @@ Inspect a fixed-time frame while changing scale/resolution, then animate at that
 
 - [Metal Shading Language specification](https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf): fragment derivatives, scalar/vector types, and sampling rules; use the revision matching the target compiler.
 - [Gustavson and McEwan's noise paper](https://jcgt.org/published/0011/01/02/paper.pdf): analytic derivatives and rotating-gradient flow animation.
+
+Sources reviewed 2026-10-13.

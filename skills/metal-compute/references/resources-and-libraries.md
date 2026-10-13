@@ -26,5 +26,7 @@ Inspect the chosen MPS operation's current documentation and availability. Check
 
 - [Apple: Resource fundamentals](https://developer.apple.com/documentation/metal/resource-fundamentals) — storage/access permissions and the limits of hazard tracking for indirect resources.
 - [Apple: Choosing a resource storage mode for Apple GPUs](https://developer.apple.com/documentation/metal/choosing-a-resource-storage-mode-for-apple-gpus) and [managed resource synchronization](https://developer.apple.com/documentation/metal/synchronizing-a-managed-resource-in-macos) — select and synchronize storage for the actual GPU architecture.
-- [Apple: Resource synchronization](https://developer.apple.com/documentation/metal/resource-synchronization) and [MTLComputeCommandEncoder](https://developer.apple.com/documentation/metal/mtlcomputecommandencoder) — classic barriers, fences, and resource-use APIs.
+- [Apple: MTLHazardTrackingMode](https://developer.apple.com/documentation/metal/mtlhazardtrackingmode), [memoryBarrier(scope:)](https://developer.apple.com/documentation/metal/mtlcomputecommandencoder/memorybarrier(scope:)), and [MTLFence](https://developer.apple.com/documentation/metal/mtlfence) — automatic tracking on classic queues, compute intrapass barriers, and pass dependencies. Use the classic encoder methods rather than Metal 4 stage/submission examples.
 - [Apple: Metal Performance Shaders](https://developer.apple.com/documentation/metalperformanceshaders) — verify the specific library operation's contract rather than assuming interchangeability.
+
+Sources reviewed 2026-10-13.

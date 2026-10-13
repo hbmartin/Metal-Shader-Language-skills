@@ -6,7 +6,9 @@ For an exact signed distance, stepping by its absolute value also handles an ins
 
 ## Complete sphere tracer and fragment
 
-This unit intentionally traces an exact sphere to make the contract testable against an analytic intersection. Results use physical distance along the internally normalized direction. Parameters must be finite, with `radius > 0`, `0 <= nearDistance <= farDistance`, and `epsilon > 0`. A zero evaluation budget returns exhaustion. The fragment binds a 16-byte `RMSphereViewParams` at buffer 0 and needs only a vertex-produced `[[position]]`; it renders an opaque lit sphere. Amber exposes budget exhaustion and magenta invalid input/arithmetic.
+This unit intentionally traces an exact sphere to make the contract testable against an analytic intersection. Results use physical distance along the internally normalized direction. Parameters must be finite, with `radius > 0`, `0 <= nearDistance <= farDistance`, and `epsilon > 0`. A zero evaluation budget returns exhaustion. A finite step that cannot advance returns `RMTraceStalled`; neither stagnation nor exhaustion establishes a hit. Checks for invalid inputs/arithmetic require compiler math settings that preserve nonfinite behavior.
+
+The fragment binds a 16-byte `RMSphereViewParams` at buffer 0 and needs only a vertex-produced `[[position]]`. Its camera is at `(0, 0, 3)`, looks toward negative Z with focal scale 1.5, and uses positive Y as up. The ray flips Metal's downward-increasing pixel Y; texture-coordinate orientation remains a separate host/asset contract. With resolution `(1920, 1080)`, radius `1`, epsilon `1e-4`, and a 512-evaluation budget, the reference setup renders an opaque lit sphere without diagnostic pixels on the verified Apple M2 Pro. This is a demonstration setting, not a universal tolerance or budget. Blue exposes precision stagnation, amber budget exhaustion, and magenta invalid input/arithmetic; tighter tolerances can still show diagnostics.
 
 ```metal
 #include <metal_stdlib>
@@ -16,7 +18,8 @@ enum RMTraceStatus : uint {
     RMTraceMiss = 0,
     RMTraceHit = 1,
     RMTraceExhausted = 2,
-    RMTraceInvalid = 3
+    RMTraceInvalid = 3,
+    RMTraceStalled = 4
 };
 
 struct RMTraceResult {
@@ -50,23 +53,19 @@ RMTraceResult rm_trace_sphere(float3 origin, float3 direction,
         if (!isfinite(d)) return {t, RMTraceInvalid, i + 1};
         if (abs(d) <= epsilon) return {t, RMTraceHit, i + 1};
         float next = t + abs(d);
-        if (!isfinite(next) || next <= t) return {t, RMTraceInvalid, i + 1};
+        if (!isfinite(next)) return {t, RMTraceInvalid, i + 1};
+        if (next <= t) return {t, RMTraceStalled, i + 1};
         t = next;
     }
     return {t, t > farDistance ? RMTraceMiss : RMTraceExhausted,
             maxEvaluations};
 }
 
-float3 rm_sphere_normal(float3 p, float3 center, float radius, float epsilon) {
-    float e = max(epsilon, 1.0e-5f);
-    float3 g = float3(
-        rm_sphere_field(p + float3(e, 0, 0), center, radius) -
-        rm_sphere_field(p - float3(e, 0, 0), center, radius),
-        rm_sphere_field(p + float3(0, e, 0), center, radius) -
-        rm_sphere_field(p - float3(0, e, 0), center, radius),
-        rm_sphere_field(p + float3(0, 0, e), center, radius) -
-        rm_sphere_field(p - float3(0, 0, e), center, radius));
-    return g / max(length(g), 1.0e-12f);
+float3 rm_sphere_normal(float3 p, float3 center) {
+    float3 radial = p - center;
+    float radialLength = length(radial);
+    return isfinite(radialLength) && radialLength > 0.0f
+        ? radial / radialLength : float3(0, 0, 1);
 }
 
 struct RMSphereViewParams {
@@ -81,16 +80,18 @@ fragment half4 rm_sphere_fragment(
 ) {
     float2 uv = (2.0f * pixelPosition.xy - params.resolution) /
                 max(params.resolution.y, 1.0f);
+    uv.y = -uv.y;
     float3 origin = float3(0, 0, 3);
     float3 direction = normalize(float3(uv, -1.5f));
     float3 center = float3(0);
     RMTraceResult result = rm_trace_sphere(origin, direction, center,
-        params.radius, 0.0f, 20.0f, params.epsilon, 128);
+        params.radius, 0.0f, 20.0f, params.epsilon, 512);
     if (result.status == RMTraceInvalid) return half4(1, 0, 1, 1);
     if (result.status == RMTraceExhausted) return half4(1, 0.5h, 0, 1);
+    if (result.status == RMTraceStalled) return half4(0, 0.4h, 1, 1);
     if (result.status == RMTraceMiss) return half4(0.02h, 0.03h, 0.05h, 1);
     float3 normal = rm_sphere_normal(origin + direction * result.distance,
-                                     center, params.radius, params.epsilon);
+                                     center);
     float light = 0.1f + 0.9f * max(dot(normal, normalize(float3(1, 1, 2))), 0.0f);
     return half4(half3(0.3h, 0.6h, 0.9h) * half(light), 1);
 }
@@ -106,3 +107,5 @@ For composition with rasterized geometry, convert the sampled depth to the rende
 
 - [Hart's sphere-tracing paper](https://graphics.stanford.edu/courses/cs348b-20-spring-content/uploads/hart.pdf): safe stepping with distance/derivative bounds and termination context.
 - [Metal Shading Language specification](https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf): stage-position semantics, types, and shader entry interfaces.
+
+Sources reviewed 2026-10-13.

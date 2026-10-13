@@ -5,12 +5,20 @@
 Use the project's existing shader build path first. For a standalone diagnostic, choose an installed SDK and the project's pre-4 language version explicitly. This example selects MSL 3.0 without setting a collection-wide minimum:
 
 ```bash
+(
+set -eu
 task_sdk=macosx
 task_msl=metal3.0
+task_library="$PWD/Shaders.metallib"
 task_build_dir=$(mktemp -d)
+trap 'rm -rf "$task_build_dir"' EXIT
 xcrun --sdk "$task_sdk" metal -std="$task_msl" -c Shaders.metal -o "$task_build_dir/Shaders.air"
 xcrun --sdk "$task_sdk" metallib "$task_build_dir/Shaders.air" -o "$task_build_dir/Shaders.metallib"
+cp "$task_build_dir/Shaders.metallib" "$task_library"
+)
 ```
+
+The subshell removes scratch files on success or failure. It publishes `Shaders.metallib` in the current directory only after linking succeeds; choose a different output path if that would replace a library you need to keep. Load or inspect the retained library before removing it.
 
 For device compilation use `iphoneos` or `appletvos` with an appropriate language version/deployment target. These checks compile for those platforms; they do not execute on a device. Check `xcrun ... metal -help` for flags supported by the installed toolchain. Add embedded sources/debug information when shader inspection is needed; avoid blanket warnings-as-errors or changing global Xcode selection to make a single recipe work.
 
