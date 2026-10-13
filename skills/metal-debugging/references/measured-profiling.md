@@ -37,3 +37,5 @@ Re-run the same workload after the change, including correctness and visual comp
 - [Apple: Analyzing the performance of your Metal app](https://developer.apple.com/documentation/xcode/analyzing-the-performance-of-your-metal-app) — Instruments Game Performance and CPU/GPU correlation.
 - [Apple: Learn performance best practices for Metal shaders](https://developer.apple.com/videos/play/tech-talks/111373/) — specialization, address-space choices, and measured use of smaller data types.
 - [Apple: Monitoring your Metal app's graphics performance](https://developer.apple.com/documentation/xcode/monitoring-your-metal-apps-graphics-performance) — supported live HUD diagnostics.
+
+Sources reviewed 2026-10-13.

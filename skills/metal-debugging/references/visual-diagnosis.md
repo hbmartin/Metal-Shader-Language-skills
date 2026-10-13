@@ -8,7 +8,7 @@ Keep diagnostic changes local and temporary. To compare images, hold camera, inp
 
 ## Executable diagnostic helpers
 
-These original functions can be compiled together or inserted into an existing fragment shader. They deliberately do not prescribe a vertex-output type or an app framework. `debug_uv` displays the supplied coordinate without wrapping it; inspect an unclipped floating-point output or the values in the shader debugger when values outside `[0,1]` matter.
+These original functions can be compiled together or inserted into an existing fragment shader. They deliberately do not prescribe a vertex-output type or an app framework. Their shared legend is magenta for NaN, cyan for Inf, and yellow for a near-zero normal; NaN takes precedence when both nonfinite kinds occur. Cyan also exposes an infinite squared normal length. This value-diagnostic legend is separate from a tracer's result-status legend. `debug_uv` displays the supplied coordinate without wrapping it; inspect an unclipped floating-point output or the values in the shader debugger when values outside `[0,1]` matter.
 
 ```metal
 #include <metal_stdlib>
@@ -23,15 +23,18 @@ float4 debug_finite_color(float4 color)
 
 float4 debug_uv(float2 uv)
 {
-    if (!all(isfinite(uv))) return float4(1.0f, 0.0f, 1.0f, 1.0f);
+    if (any(isnan(uv))) return float4(1.0f, 0.0f, 1.0f, 1.0f);
+    if (any(isinf(uv))) return float4(0.0f, 1.0f, 1.0f, 1.0f);
     return float4(uv.x, uv.y, 0.0f, 1.0f);
 }
 
 float4 debug_normal(float3 normal)
 {
-    if (!all(isfinite(normal))) return float4(1.0f, 0.0f, 1.0f, 1.0f);
+    if (any(isnan(normal))) return float4(1.0f, 0.0f, 1.0f, 1.0f);
+    if (any(isinf(normal))) return float4(0.0f, 1.0f, 1.0f, 1.0f);
     float lengthSquared = dot(normal, normal);
-    if (lengthSquared <= 1.0e-12f) return float4(0.0f, 1.0f, 1.0f, 1.0f);
+    if (isinf(lengthSquared)) return float4(0.0f, 1.0f, 1.0f, 1.0f);
+    if (lengthSquared <= 1.0e-12f) return float4(1.0f, 1.0f, 0.0f, 1.0f);
     return float4(normal * rsqrt(lengthSquared) * 0.5f + 0.5f, 1.0f);
 }
 ```
@@ -62,3 +65,5 @@ Function constants specialize shader functions; changing them requires a newly s
 - [Apple: Inspecting the bound resources for a command](https://developer.apple.com/documentation/xcode/inspecting-the-bound-resources-for-a-command) — verify the input that a captured command actually receives.
 - [Apple: Inspecting shaders](https://developer.apple.com/documentation/xcode/inspecting-shaders) — source inspection and captured-work shader iteration.
 - [Apple: MSL specification](https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf) — raster coordinates, derivatives, function constants, and numerical/math-mode behavior; select the applicable pre-4 features.
+
+Sources reviewed 2026-10-13.

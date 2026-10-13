@@ -15,14 +15,22 @@ xcrun --sdk macosx --show-sdk-version
 Here is a **macOS / MSL 3.1 example**, not a default for an arbitrary project. Change the SDK (`macosx`, `iphoneos`, `appletvos`, or the project's other target SDK) and standard to match its build. Also use its deployment-target flags when validating compatibility; a language selection alone does not set every host build constraint.
 
 ```sh
+(
+set -eu
 metal_sdk="macosx"
 metal_language="metal3.1"
+metal_library="$PWD/Shaders.metallib"
 metal_build_dir="$(mktemp -d)"
+trap 'rm -rf "$metal_build_dir"' EXIT
 xcrun --sdk "$metal_sdk" metal -std="$metal_language" \
     -c Shaders.metal -o "$metal_build_dir/Shaders.air"
-xcrun --sdk "$metal_sdk" metal \
+xcrun --sdk "$metal_sdk" metallib \
     "$metal_build_dir/Shaders.air" -o "$metal_build_dir/Shaders.metallib"
+cp "$metal_build_dir/Shaders.metallib" "$metal_library"
+)
 ```
+
+Scratch files are removed when the subshell exits, including after a failed command. A successful link retains `Shaders.metallib` in the current directory for library loading and pipeline checks; change the output path if an existing library must be preserved.
 
 The first command checks source compilation; the second builds a library. Neither creates or executes the app's render/compute pipeline. For an isolated diagnostic involving NaN/Inf or sensitivity to optimizations, compare with `-fno-fast-math` without changing the shipping configuration. Do not silently add `-Werror` or switch the system-wide Xcode selection.
 
@@ -54,3 +62,5 @@ For an existing programmatic capture path, use `MTLCaptureManager` with an `MTLC
 - [Apple: Validating Metal API usage](https://developer.apple.com/documentation/xcode/validating-your-apps-metal-api-usage) and [Shader Validation](https://developer.apple.com/documentation/xcode/validating-your-apps-metal-shader-usage) — diagnostics and environment settings.
 - [Apple: Debug GPU-side errors in Metal, WWDC20](https://developer.apple.com/videos/play/wwdc2020/10616/) — command-buffer encoder status and generated-source diagnostics.
 - [Apple: Capturing a Metal workload in Xcode](https://developer.apple.com/documentation/xcode/capturing-a-metal-workload-in-xcode) and [programmatically](https://developer.apple.com/documentation/xcode/capturing-a-metal-workload-programmatically) — target-scoped capture and its enablement.
+
+Sources reviewed 2026-10-13.

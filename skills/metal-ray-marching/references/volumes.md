@@ -74,3 +74,5 @@ Lighting may require a secondary density integral toward the light. Budget it se
 
 - [Physically Based Rendering, transmittance](https://pbr-book.org/4ed/Volume_Scattering/Transmittance): author textbook on Beer’s law, optical thickness, and multiplicative segment transmittance.
 - [Gustavson and McEwan's noise paper](https://jcgt.org/published/0011/01/02/paper.pdf): animated/periodic density building blocks and derivatives; it does not prescribe a universal march step count.
+
+Sources reviewed 2026-10-13.

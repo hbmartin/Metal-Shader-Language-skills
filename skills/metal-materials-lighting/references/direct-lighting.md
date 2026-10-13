@@ -72,3 +72,5 @@ Check metallic 1 with black base color at normal incidence (`V = L = N`): the re
 For point lights, guard distance near zero according to the light's physical or artistic size instead of allowing inverse-square singularities. Use geometry/shadow visibility for occlusion; do not multiply ambient occlusion into every direct light by default. When adding IBL or layered lobes, keep their roughness and energy conventions aligned with the existing renderer.
 
 Theory: [Heitz's masking-shadowing analysis](https://jcgt.org/published/0003/02/03/) establishes model consistency; [Filament's material equations](https://google.github.io/filament/main/filament.html#materialsystem/specularbrdf) give a practical GGX/Smith formulation. The code here is original MSL illustrating those equations, not vendored framework source.
+
+Sources reviewed 2026-10-13.

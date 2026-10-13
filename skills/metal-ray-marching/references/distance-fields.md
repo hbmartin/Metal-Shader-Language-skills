@@ -71,3 +71,5 @@ Normals are gradients of the final field, including its transforms. Check that a
 
 - [Hart, Sphere Tracing](https://graphics.stanford.edu/courses/cs348b-20-spring-content/uploads/hart.pdf): geometric distance, conservative derivative bounds, and transformed implicit surfaces.
 - [Quilez's distance-functions reference](https://iquilezles.org/articles/distfunctions/): author reference for primitive/deformation families. The supplied helpers are concise formulas written for this skill, not a copied primitive catalog.
+
+Sources reviewed 2026-10-13.

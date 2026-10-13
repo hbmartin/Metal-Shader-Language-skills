@@ -50,6 +50,8 @@ fragment half4 pe_blur_fragment(
 
 Use `float` accumulators/samples if the HDR range or filter precision requires it. Choose a standard MPS filter when it matches the operation and fits the current pipeline; `MPSImageGaussianBlur` is an approximate Gaussian, so analytically strict kernels may need explicit convolution. Custom code is useful for a particular sample pattern or combined treatment. Neither path is universally fastest.
 
+For texel-center-aligned UVs and a one-texel horizontal or vertical step at the sampled mip, linear filtering can pair the two positive taps and the two negative taps. Keep the center weight `0.38774`, and use one sample on each side with weight `0.30613` at offset `1.2004377 * texelStep`. This reproduces the five-tap kernel in exact arithmetic under those sampling assumptions; half precision and sampler interpolation can introduce small differences. Fractional UV alignment, resized passes, wider tap spacing, or different mip sampling can break the equivalence. Keep the five-sample form for those cases, and measure before claiming a speedup.
+
 Verify a constant image remains constant, impulse response is symmetric, transparent edges remain clean, and texture boundaries match the chosen addressing. Inspect a neutral gray through the complete pipeline to catch double transfer encoding. Compare blur cost at the actual input/output sizes, including pass bandwidth.
 
 ## Sources
@@ -57,3 +59,5 @@ Verify a constant image remains constant, impulse response is symmetric, transpa
 - [Metal Shading Language specification](https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf): texture/sampler operations and stage inputs.
 - [Apple's sRGB pixel format reference](https://developer.apple.com/documentation/metal/mtlpixelformat/bgra8unorm_srgb): format semantics at the rendering boundary.
 - [MPSImageGaussianBlur](https://developer.apple.com/documentation/metalperformanceshaders/mpsimagegaussianblur): the standard Metal filter alternative.
+
+Sources reviewed 2026-10-13.

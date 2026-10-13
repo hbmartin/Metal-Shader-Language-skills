@@ -62,3 +62,5 @@ Match the pipeline's color/depth/stencil formats and raster sample count to its 
 For source-over with add operations, set source/destination RGB factors to `.one`/`.oneMinusSourceAlpha` for premultiplied RGB, or `.sourceAlpha`/`.oneMinusSourceAlpha` for straight RGB. Alpha factors are `.one`/`.oneMinusSourceAlpha` in either case. A straight RGB shader paired with premultiplied factors creates bright fringes; multiplying premultiplied RGB by alpha again creates dark fringes. Composite in linear space and keep the output encoding agreed with the attachment.
 
 Transparent geometry commonly uses depth testing with depth writes disabled and back-to-front ordering; preserve an existing order-independent approach when present. Alpha-to-coverage is an MSAA coverage technique with its own assumptions, not a substitute for all transparency. [Blend configuration](https://developer.apple.com/documentation/metal/mtlrenderpipelinecolorattachmentdescriptor) belongs to the pipeline.
+
+Sources reviewed 2026-10-13.

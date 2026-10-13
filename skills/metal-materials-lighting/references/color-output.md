@@ -45,3 +45,5 @@ The [Apple resource guide](https://developer.apple.com/library/archive/documenta
 Use an appropriate floating-point intermediate, such as `.rgba16Float`, when radiance can exceed 1. Retain precision and finite bounds through emission, bloom, and exposure. HDR/EDR presentation requires the host layer's supported format, color space, and display policy; a float texture alone does not enable it. Preserve values above SDR white when the established presentation path expects extended linear output. Apple's [custom EDR tone-mapping guidance](https://developer.apple.com/documentation/metal/performing-your-own-tone-mapping) covers that host contract.
 
 Check a neutral ramp with tone mapping bypassed: linear 0.18 encodes near 0.461 in sRGB, while alpha 0.18 stays 0.18. Check transparent edges over dark and bright backgrounds, emissive values above 1, and an exposure sweep. Record whether each inspected image represents linear intermediate data or encoded display output; a screenshot cannot establish the absence of internal NaNs or confirm every HDR presentation condition.
+
+Sources reviewed 2026-10-13.

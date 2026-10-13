@@ -36,5 +36,7 @@ For CPU readback, wait for the producing GPU work through the app's completion/e
 ## Sources
 
 - [Apple: MSL specification](https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf) — execution scopes, memory flags, atomic operations, and texture reads, filtered by the selected pre-4 language version.
-- [Apple: Resource synchronization](https://developer.apple.com/documentation/metal/resource-synchronization) — choose command-level ordering for producer/consumer dependencies; use its pre-Metal-4 sections.
+- [Apple: memoryBarrier(scope:)](https://developer.apple.com/documentation/metal/mtlcomputecommandencoder/memorybarrier(scope:)) and [MTLFence](https://developer.apple.com/documentation/metal/mtlfence) — classic intrapass and interpass producer/consumer ordering. A shader threadgroup barrier does not order separate dispatches or provide a global rendezvous.
 - [Apple: Synchronizing events between a GPU and the CPU](https://developer.apple.com/documentation/metal/synchronizing-events-between-a-gpu-and-the-cpu) — asynchronous CPU/GPU coordination with shared events when supported.
+
+Sources reviewed 2026-10-13.

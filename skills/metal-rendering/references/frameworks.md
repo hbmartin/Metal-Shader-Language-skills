@@ -25,3 +25,5 @@ Use `MTIFunctionDescriptor` and the framework's render/compute kernel contracts 
 These frameworks' core repositories report MIT licensing; preserve relevant notices if copying their code. This skill vendors none. Raster's [`RasterExamples` license](https://github.com/aldealabs/raster/blob/master/RasterExamples/LICENSE.md) restricts that directory to non-commercial testing/evaluation, so do not copy its assets/code into distributable templates under the core license.
 
 ShaderKit (`jamesrochabrun/ShaderKit`) and Inferno (`twostraws/Inferno`) are SwiftUI integrations, while current MetalSprockets centers on Metal 4. They are outside this skill's integration scope. General ideas such as immutable pipeline cache keys, bounded sampling, and explicit alpha contracts can be applied directly without adopting their APIs.
+
+Sources reviewed 2026-10-13.
