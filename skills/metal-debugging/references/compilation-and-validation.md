@@ -19,20 +19,31 @@ Here is a **macOS / MSL 3.1 example**, not a default for an arbitrary project. C
 set -eu
 metal_sdk="macosx"
 metal_language="metal3.1"
-metal_library="$PWD/Shaders.metallib"
+metal_library="$PWD/Shaders.diagnostic.metallib"
+if [ -e "$metal_library" ] || [ -L "$metal_library" ]; then
+    printf 'Diagnostic output already exists: %s\n' "$metal_library" >&2
+    exit 1
+fi
 metal_build_dir="$(mktemp -d)"
 trap 'rm -rf "$metal_build_dir"' EXIT
 xcrun --sdk "$metal_sdk" metal -std="$metal_language" \
     -c Shaders.metal -o "$metal_build_dir/Shaders.air"
 xcrun --sdk "$metal_sdk" metallib \
     "$metal_build_dir/Shaders.air" -o "$metal_build_dir/Shaders.metallib"
-cp "$metal_build_dir/Shaders.metallib" "$metal_library"
+if [ -e "$metal_library" ] || [ -L "$metal_library" ]; then
+    printf 'Diagnostic output already exists: %s\n' "$metal_library" >&2
+    exit 1
+fi
+if ! cp -n "$metal_build_dir/Shaders.metallib" "$metal_library"; then
+    printf 'Could not publish diagnostic output: %s\n' "$metal_library" >&2
+    exit 1
+fi
 )
 ```
 
-Scratch files are removed when the subshell exits, including after a failed command. A successful link retains `Shaders.metallib` in the current directory for library loading and pipeline checks; change the output path if an existing library must be preserved.
+The subshell removes scratch files on success or failure. It retains `Shaders.diagnostic.metallib` in the current directory after a successful link and copy. It rejects an existing output file, directory, or symlink before compilation and checks again before publication; `cp -n` also prevents replacing an output file created between the final check and copy. Choose a fresh diagnostic output path for another run. The recipe leaves an existing `Shaders.metallib` untouched.
 
-The first command checks source compilation; the second builds a library. Neither creates or executes the app's render/compute pipeline. For an isolated diagnostic involving NaN/Inf or sensitivity to optimizations, compare with `-fno-fast-math` without changing the shipping configuration. Do not silently add `-Werror` or switch the system-wide Xcode selection.
+`metal -c` checks source compilation; `metallib` links the compiled source into a library. Neither creates or executes the app's render/compute pipeline. For an isolated diagnostic involving NaN/Inf or sensitivity to optimizations, compare with `-fno-fast-math` without changing the shipping configuration. Do not silently add `-Werror` or switch the system-wide Xcode selection.
 
 For runtime source compilation, retain the compiler's full error and the source/options that produced it. Add a useful `#line` filename when generated source needs stable diagnostic locations. Check that the expected entry point exists in the loaded library and that pipeline creation succeeds with the actual attachment formats or compute settings.
 

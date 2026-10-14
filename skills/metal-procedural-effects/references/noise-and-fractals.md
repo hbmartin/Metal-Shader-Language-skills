@@ -6,7 +6,7 @@ Choose a field from its visual and numerical needs. Value noise is a small smoot
 
 Wrap the lattice before hashing to make a periodic field. Applying `fract` to an arbitrary noise input can create a seam. The square-lattice example below supports positive integer periods on either axis, with zero disabling wrapping on that axis. Both values and interpolation derivatives agree at the seams. Keep coordinates finite and within the useful integer/fractional precision of `float`; move the origin near the region being shaded for large worlds.
 
-The following is a complete helper translation unit. It uses a small integer-mixed value field and quintic interpolation, rather than a copied simplex implementation. `pe_value_noise_2d` returns values in `[0, 1)`; this is not a Perlin or simplex algorithm. The fixed nonzero hash salt prevents cell `(0, 0)` from being an absorbing zero. The salt and octave transforms change generated values relative to the earlier unsalted, aligned example; they remain deterministic.
+The following is a complete helper translation unit. It uses a small integer-mixed value field and quintic interpolation, rather than a copied simplex implementation. `pe_value_noise_2d` returns values in `[0, 1)`; this is not a Perlin or simplex algorithm. The fixed nonzero hash salt prevents cell `(0, 0)` from being an absorbing zero. Output is deterministic; keep the salt and octave transforms stable when an asset or effect needs repeatable noise values.
 
 ```metal
 #include <metal_stdlib>

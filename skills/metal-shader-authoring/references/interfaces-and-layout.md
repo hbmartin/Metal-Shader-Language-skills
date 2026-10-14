@@ -34,7 +34,7 @@ Host buffer 0 must contain at least `count` float4 elements. For this struct, `t
 - Ordinary `float3` has 16-byte size/alignment; `packed_float3` stores three floats in 12 bytes with scalar alignment. A `.float3` vertex attribute fetched through a vertex descriptor is a different question from a buffer-struct member's ABI.
 - Verify nested structs, arrays, and matrix column stride. A `float3x3` consists of padded columns; do not assume nine tightly packed floats. Match column/row convention and multiplication order independently of storage compatibility.
 - On Swift hosts, check `MemoryLayout` stride/alignment and actual field offsets, not only size. On C/C++ hosts, use the appropriate SIMD/shared declarations and static assertions. Never make a Swift `Bool` or an arbitrary host enum part of an unverified GPU ABI.
-- Type alignment and binding-offset alignment are separate constraints. For directly bound device buffers, retain the pointed-to type's alignment; constant-buffer offsets must also meet the target GPU's minimum binding alignment. Consult the selected encoder API and applicable feature tables. Apple GPU families currently list a 4-byte minimum constant-buffer offset alignment; other targets can impose stricter requirements. An allocator's 256-byte convention is neither a universal MSL struct-alignment rule nor a requirement inferred from macOS alone.
+- Type alignment and binding-offset alignment are separate constraints. For directly bound device buffers, retain the pointed-to type's alignment; constant-buffer offsets must also meet the target GPU/environment's minimum binding alignment. Consult the selected encoder API and applicable feature tables. Apple-family GPUs currently list a 4-byte minimum constant-buffer offset alignment; do not apply that row to Intel/AMD Mac GPUs without verifying their GPU- and OS-specific requirements. Apple's Simulator guidance specifies 256-byte constant-buffer offsets. An allocator's 256-byte convention is not a universal MSL struct-alignment rule, and a macOS host alone does not identify the binding requirement.
 
 ## Coordinate contracts
 
@@ -48,5 +48,6 @@ Procedural UV normalization should use actual drawable/texture pixel dimensions,
 - [MTLVertexDescriptor](https://developer.apple.com/documentation/metal/mtlvertexdescriptor): vertex attribute fetch configuration.
 - [Resource fundamentals](https://developer.apple.com/documentation/metal/resource-fundamentals): host resource types and ownership.
 - [setBuffer(_:offset:index:)](https://developer.apple.com/documentation/metal/mtlcomputecommandencoder/setbuffer(_:offset:index:)) and [Metal feature tables](https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf): type alignment and target-specific constant-buffer binding offsets.
+- [Developing Metal apps that run in Simulator](https://developer.apple.com/documentation/metal/developing-metal-apps-that-run-in-simulator): Simulator-specific constant-buffer offset restrictions.
 
 Sources reviewed 2026-10-13. Examples are original, and their ABI is part of the example's explicit contract.

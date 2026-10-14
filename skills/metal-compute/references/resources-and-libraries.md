@@ -14,6 +14,8 @@ For direct resources with hazard tracking on an `MTLCommandQueue`, preserve the 
 
 Use a supported compute memory barrier for dependent commands within a compute pass, fences for GPU pass dependencies, and events where queue or CPU coordination needs them. Match the synchronized stages to the actual reader and writer; a compute-to-fragment dependency need not block unrelated vertex work. Do not copy newer queue-barrier API calls into a classic encoder.
 
+For a supported classic cross-queue dependency on one device, signal an `MTLEvent` with `MTLCommandBuffer.encodeSignalEvent(_:value:)` after the producing work and wait for that value with `encodeWaitForEvent(_:value:)` before the consuming work. End active encoders before encoding these command-buffer operations. Use increasing event values when reusing an event; CPU coordination uses supported shared-event APIs instead.
+
 Order writes before reads and before reusing or aliasing their memory. Consider read-after-write, write-after-read, and write-after-write conflicts. Keep CPU modifications outside the resource's in-flight GPU ownership interval, even with shared storage. Resource synchronization is not a substitute for fixing two threads that write the same output element in a kernel.
 
 ## Optional Metal Performance Shaders
@@ -27,6 +29,7 @@ Inspect the chosen MPS operation's current documentation and availability. Check
 - [Apple: Resource fundamentals](https://developer.apple.com/documentation/metal/resource-fundamentals) — storage/access permissions and the limits of hazard tracking for indirect resources.
 - [Apple: Choosing a resource storage mode for Apple GPUs](https://developer.apple.com/documentation/metal/choosing-a-resource-storage-mode-for-apple-gpus) and [managed resource synchronization](https://developer.apple.com/documentation/metal/synchronizing-a-managed-resource-in-macos) — select and synchronize storage for the actual GPU architecture.
 - [Apple: MTLHazardTrackingMode](https://developer.apple.com/documentation/metal/mtlhazardtrackingmode), [memoryBarrier(scope:)](https://developer.apple.com/documentation/metal/mtlcomputecommandencoder/memorybarrier(scope:)), and [MTLFence](https://developer.apple.com/documentation/metal/mtlfence) — automatic tracking on classic queues, compute intrapass barriers, and pass dependencies. Use the classic encoder methods rather than Metal 4 stage/submission examples.
+- [Apple: About synchronization events](https://developer.apple.com/documentation/metal/about-synchronization-events) and [Synchronizing events within a single device](https://developer.apple.com/documentation/metal/synchronizing-events-within-a-single-device) — classic command-buffer signal/wait dependencies across queues on one device.
 - [Apple: Metal Performance Shaders](https://developer.apple.com/documentation/metalperformanceshaders) — verify the specific library operation's contract rather than assuming interchangeability.
 
 Sources reviewed 2026-10-13.
