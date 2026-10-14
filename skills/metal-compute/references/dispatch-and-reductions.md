@@ -2,18 +2,7 @@
 
 ## Independent map
 
-This original example doubles a buffer. Binding 0 is a read-only `count`-element float buffer; binding 1 is a separate writable buffer with at least `count` floats; binding 2 is one unsigned 32-bit count. The device-buffer offsets must retain the float type's 4-byte alignment. The count's constant-buffer offset must satisfy both uint alignment and the target GPU/environment's constant-buffer binding requirement. These are separate constraints: consult `setBuffer(_:offset:index:)` and the applicable feature tables rather than assuming type alignment is always sufficient. Skip dispatch for zero count.
-
-This alignment guidance covers physical Apple-family GPUs, including Apple silicon Macs, and Simulator. Apple-family GPUs currently list a 4-byte minimum constant-buffer offset alignment. Simulator requires 256-byte constant-buffer offsets even though its reported capabilities resemble Apple family 2. Check the Simulator environment before applying GPU-family rules; `supportsFamily(.apple2)` alone cannot select the alignment. In Swift, use `targetEnvironment(simulator)` as below; C/Objective-C uses `TARGET_OS_SIMULATOR` from `<TargetConditionals.h>`.
-
-```swift
-#if targetEnvironment(simulator)
-let minimumConstantBufferOffsetAlignment = 256
-#else
-// Physical Apple-family GPU; retain the bound type's alignment as well.
-let minimumConstantBufferOffsetAlignment = 4
-#endif
-```
+This original example doubles a buffer. Binding 0 is a read-only `count`-element float buffer; binding 1 is a separate writable buffer with at least `count` floats; binding 2 is one unsigned 32-bit count. The device-buffer offsets must retain the float type's 4-byte alignment. If binding the count from an `MTLBuffer`, its offset must satisfy both uint alignment and the target GPU/environment's constant-buffer binding requirement. These are separate constraints: consult `setBuffer(_:offset:index:)` and the applicable feature tables rather than assuming type alignment is always sufficient. Skip dispatch for zero count.
 
 ```metal
 #include <metal_stdlib>
@@ -28,6 +17,21 @@ kernel void map_double(
     if (gid >= count) return;
     output[gid] = input[gid] * 2.0f;
 }
+```
+
+For this four-byte count, prefer `setBytes(_:length:index:)` with length 4 at index 2 to let Metal copy the scalar without a caller-managed buffer offset. If suballocating constants from an `MTLBuffer`, retain both type alignment and binding-offset alignment.
+
+This alignment guidance covers physical Apple-family GPUs, including Apple silicon Macs, and Simulator. Apple-family GPUs currently list a 4-byte minimum constant-buffer offset alignment. Simulator requires 256-byte constant-buffer offsets even though its reported capabilities resemble Apple family 2. Check the Simulator environment before applying GPU-family rules; `supportsFamily(.apple2)` alone cannot select the alignment. In Swift, use `targetEnvironment(simulator)` as below. In C/Objective-C, include `<TargetConditionals.h>` and test `#if TARGET_OS_SIMULATOR`.
+
+```swift
+#if targetEnvironment(simulator)
+let minimumConstantBufferOffsetAlignment = 256
+#elseif arch(arm64)
+// Physical Apple-family GPU; retain the bound type's alignment as well.
+let minimumConstantBufferOffsetAlignment = 4
+#else
+#error("This alignment example covers physical Apple-family GPUs and Simulator.")
+#endif
 ```
 
 For a legal one-dimensional group size `T`, either dispatch exactly `(count, 1, 1)` threads on a device supporting nonuniform groups, or dispatch `ceil(count / T)` complete groups of `(T, 1, 1)`. The guard supports either. Choose `T` from the pipeline's limits; multiples of its `threadExecutionWidth` are candidates for efficient execution. Keep unused dimensions equal to one.
@@ -81,6 +85,7 @@ The dimensional thread built-ins in this one-dimensional signature all use scala
 ## Sources
 
 - [Apple: setBuffer(_:offset:index:)](https://developer.apple.com/documentation/metal/mtlcomputecommandencoder/setbuffer(_:offset:index:)) and [Metal feature tables](https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf) — distinguish device type alignment from hardware-dependent constant-buffer offset alignment.
+- [Apple: setBytes(_:length:index:)](https://developer.apple.com/documentation/metal/mtlcomputecommandencoder/setbytes(_:length:index:)) — copy small constants without allocating a separate buffer.
 - [Apple: Developing Metal apps that run in Simulator](https://developer.apple.com/documentation/metal/developing-metal-apps-that-run-in-simulator) — Simulator-specific constant-buffer offset restrictions.
 - [Apple: Calculating threadgroup and grid sizes](https://developer.apple.com/documentation/metal/calculating-threadgroup-and-grid-sizes) — pipeline-dependent limits and uniform versus nonuniform dispatch.
 - [Apple: threadExecutionWidth](https://developer.apple.com/documentation/metal/mtlcomputepipelinestate/threadexecutionwidth) — query the execution width instead of hardcoding it.

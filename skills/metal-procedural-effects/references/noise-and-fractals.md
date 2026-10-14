@@ -6,7 +6,9 @@ Choose a field from its visual and numerical needs. Value noise is a small smoot
 
 Wrap the lattice before hashing to make a periodic field. Applying `fract` to an arbitrary noise input can create a seam. The square-lattice example below supports positive integer periods on either axis, with zero disabling wrapping on that axis. Both values and interpolation derivatives agree at the seams. Keep coordinates finite and within the useful integer/fractional precision of `float`; move the origin near the region being shaded for large worlds.
 
-The following is a complete helper translation unit. It uses a small integer-mixed value field and quintic interpolation, rather than a copied simplex implementation. `pe_value_noise_2d` returns values in `[0, 1)`; this is not a Perlin or simplex algorithm. The fixed nonzero hash salt prevents cell `(0, 0)` from being an absorbing zero. For a given integer cell, the hash and its 24-bit conversion to a power-of-two-scaled float are exact. Interpolation and fBm use floating-point arithmetic: results are repeatable with fixed inputs, implementation, GPU, compiler, and math settings, but bitwise equality across those configurations is not promised. Keep the salt and octave transforms stable when an asset or effect needs repeatable noise values.
+The following is a complete helper translation unit. It uses a small integer-mixed value field and quintic interpolation, rather than a copied simplex implementation. `pe_value_noise_2d` returns values in `[0, 1)` for the valid coordinates described above; this is not a Perlin or simplex algorithm. Floating-point evaluation can make the quintic weight overshoot, so the final result is clamped to zero through `0x1.fffffep-1f`, the largest float below one. When using noise to select a palette entry, also bound the integer index to the palette's valid range.
+
+The fixed nonzero hash salt prevents cell `(0, 0)` from being an absorbing zero. For a given integer cell, the hash and its 24-bit conversion to a power-of-two-scaled float are exact. Interpolation and fBm use floating-point arithmetic: results are repeatable within the same complete compiled shader program with fixed inputs, GPU, compiler, and math settings. Separately compiled kernels and fragment shaders can optimize the same helper text differently; bitwise equality between those programs or across configurations is not promised. Keep the salt and octave transforms stable when an asset or effect needs repeatable noise values.
 
 ```metal
 #include <metal_stdlib>
@@ -43,7 +45,8 @@ float pe_value_noise_2d(float2 p, int2 period) {
     float b = pe_lattice_value(cell + int2(1, 0), period);
     float c = pe_lattice_value(cell + int2(0, 1), period);
     float d = pe_lattice_value(cell + int2(1, 1), period);
-    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+    float value = mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+    return clamp(value, 0.0f, 0x1.fffffep-1f);
 }
 
 // Signed fBm, up to eight octaves in this example. Footprint is the
