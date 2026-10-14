@@ -25,3 +25,13 @@ The entrypoints route to deeper references as needed. No third-party framework, 
 Guidance is checked against Apple's MSL specification, classic Metal documentation, feature tables, and primary algorithm sources linked in the references. Each reference records a `Sources reviewed YYYY-MM-DD` date for the latest check of its cited guidance. This is the collection's research snapshot, not a source publication date or a guarantee of compatibility with every target. Check target-specific availability when using an advanced feature. Compilation on a recent SDK alone does not establish older-device compatibility.
 
 Background notes remain research inputs and are not redistributed as skill references. The collection does not bundle downloaded applications, archives, copied manuals, or third-party tooling. Original examples use this repository's Apache-2.0 license; any future adapted third-party implementations must retain their applicable notices.
+
+## Verify reference examples
+
+Run the standard-library regression suite with Python 3.8 or newer, disabling bytecode output to keep the checkout clean:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests
+```
+
+The suite extracts the documented examples, checks paired copies for consistency, and exercises temporary builds, guarded cleanup, output publication, and cancellation from available bash, dash, and zsh callers. Compiler stubs make shell failures and signal timing reproducible. With Xcode toolchains available, it also checks Swift and C/Objective-C alignment examples across macOS, Mac Catalyst, and Simulator targets and performs a real Metal compile/link check. Unavailable toolchain checks are reported as skipped. All generated fixtures and diagnostic outputs stay in temporary directories outside the checkout and are never committed.

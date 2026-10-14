@@ -34,19 +34,18 @@ Host buffer 0 must contain at least `count` float4 elements. For this struct, `t
 - Ordinary `float3` has 16-byte size/alignment; `packed_float3` stores three floats in 12 bytes with scalar alignment. A `.float3` vertex attribute fetched through a vertex descriptor is a different question from a buffer-struct member's ABI.
 - Verify nested structs, arrays, and matrix column stride. A `float3x3` consists of padded columns; do not assume nine tightly packed floats. Match column/row convention and multiplication order independently of storage compatibility.
 - On Swift hosts, check `MemoryLayout` stride/alignment and actual field offsets, not only size. On C/C++ hosts, use the appropriate SIMD/shared declarations and static assertions. Never make a Swift `Bool` or an arbitrary host enum part of an unverified GPU ABI.
-- Type alignment and binding-offset alignment are separate constraints. For directly bound device buffers, retain the pointed-to type's alignment; constant-buffer offsets must also meet the target GPU/environment's minimum binding alignment. Consult the selected encoder API and applicable feature tables. The alignment guidance here covers physical Apple-family GPUs, including Apple silicon Macs, and Simulator. Apple-family GPUs currently list a 4-byte minimum constant-buffer offset alignment; Simulator requires 256 bytes even though its reported capabilities resemble Apple family 2. An allocator's 256-byte convention is not a universal MSL struct-alignment rule.
+- Type alignment and binding-offset alignment are separate constraints. For directly bound device buffers, retain the pointed-to type's alignment; constant-buffer offsets must also meet the target GPU/environment's minimum binding alignment. Consult the selected encoder API and applicable feature tables. An allocator's 256-byte convention is not a universal MSL struct-alignment rule.
 
-Check the Simulator environment before applying GPU-family rules; `supportsFamily(.apple2)` alone cannot select the alignment. In Swift, use `targetEnvironment(simulator)` as below. In C/Objective-C, include `<TargetConditionals.h>` and test `#if TARGET_OS_SIMULATOR`.
+For a portable constant-buffer suballocation policy, use 256-byte binding offsets on every target, including Intel/AMD Macs, Apple silicon Macs, Mac Catalyst, and Simulator. This is a conservative allocator policy, not the hardware minimum on every GPU or a change to MSL type alignment. Apple-family GPUs list a 4-byte minimum constant-buffer offset alignment; Simulator requires 256 bytes even when it reports Apple-family capabilities. Retain the bound type's alignment as well. Choosing a smaller hardware minimum is a separate optimization based on the selected runtime device and environment, not the CPU architecture.
 
 ```swift
-#if targetEnvironment(simulator)
-let minimumConstantBufferOffsetAlignment = 256
-#elseif arch(arm64)
-// Physical Apple-family GPU; retain the bound type's alignment as well.
-let minimumConstantBufferOffsetAlignment = 4
-#else
-#error("This alignment example covers physical Apple-family GPUs and Simulator.")
-#endif
+let constantBufferOffsetAlignment = 256
+```
+
+Use the same policy in C/Objective-C:
+
+```c
+enum { constantBufferOffsetAlignment = 256 };
 ```
 
 ## Coordinate contracts

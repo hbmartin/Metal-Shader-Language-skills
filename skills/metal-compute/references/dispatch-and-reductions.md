@@ -21,17 +21,16 @@ kernel void map_double(
 
 For this four-byte count, prefer `setBytes(_:length:index:)` with length 4 at index 2 to let Metal copy the scalar without a caller-managed buffer offset. If suballocating constants from an `MTLBuffer`, retain both type alignment and binding-offset alignment.
 
-This alignment guidance covers physical Apple-family GPUs, including Apple silicon Macs, and Simulator. Apple-family GPUs currently list a 4-byte minimum constant-buffer offset alignment. Simulator requires 256-byte constant-buffer offsets even though its reported capabilities resemble Apple family 2. Check the Simulator environment before applying GPU-family rules; `supportsFamily(.apple2)` alone cannot select the alignment. In Swift, use `targetEnvironment(simulator)` as below. In C/Objective-C, include `<TargetConditionals.h>` and test `#if TARGET_OS_SIMULATOR`.
+For a portable constant-buffer suballocation policy, use 256-byte binding offsets on every target, including Intel/AMD Macs, Apple silicon Macs, Mac Catalyst, and Simulator. This is a conservative allocator policy, not the hardware minimum on every GPU or a change to MSL type alignment. Apple-family GPUs list a 4-byte minimum constant-buffer offset alignment; Simulator requires 256 bytes even when it reports Apple-family capabilities. Retain the bound type's alignment as well. Choosing a smaller hardware minimum is a separate optimization based on the selected runtime device and environment, not the CPU architecture.
 
 ```swift
-#if targetEnvironment(simulator)
-let minimumConstantBufferOffsetAlignment = 256
-#elseif arch(arm64)
-// Physical Apple-family GPU; retain the bound type's alignment as well.
-let minimumConstantBufferOffsetAlignment = 4
-#else
-#error("This alignment example covers physical Apple-family GPUs and Simulator.")
-#endif
+let constantBufferOffsetAlignment = 256
+```
+
+Use the same policy in C/Objective-C:
+
+```c
+enum { constantBufferOffsetAlignment = 256 };
 ```
 
 For a legal one-dimensional group size `T`, either dispatch exactly `(count, 1, 1)` threads on a device supporting nonuniform groups, or dispatch `ceil(count / T)` complete groups of `(T, 1, 1)`. The guard supports either. Choose `T` from the pipeline's limits; multiples of its `threadExecutionWidth` are candidates for efficient execution. Keep unused dimensions equal to one.
