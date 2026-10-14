@@ -4,7 +4,16 @@
 
 This original example doubles a buffer. Binding 0 is a read-only `count`-element float buffer; binding 1 is a separate writable buffer with at least `count` floats; binding 2 is one unsigned 32-bit count. The device-buffer offsets must retain the float type's 4-byte alignment. The count's constant-buffer offset must satisfy both uint alignment and the target GPU/environment's constant-buffer binding requirement. These are separate constraints: consult `setBuffer(_:offset:index:)` and the applicable feature tables rather than assuming type alignment is always sufficient. Skip dispatch for zero count.
 
-Apple-family GPUs currently list a 4-byte minimum constant-buffer offset alignment. Do not apply that row to Intel/AMD Mac GPUs; verify their GPU- and OS-specific binding requirements. Simulator has its own restrictions: Apple's Simulator guidance specifies 256-byte constant-buffer offsets. A macOS host alone does not identify which rule applies.
+This alignment guidance covers physical Apple-family GPUs, including Apple silicon Macs, and Simulator. Apple-family GPUs currently list a 4-byte minimum constant-buffer offset alignment. Simulator requires 256-byte constant-buffer offsets even though its reported capabilities resemble Apple family 2. Check the Simulator environment before applying GPU-family rules; `supportsFamily(.apple2)` alone cannot select the alignment. In Swift, use `targetEnvironment(simulator)` as below; C/Objective-C uses `TARGET_OS_SIMULATOR` from `<TargetConditionals.h>`.
+
+```swift
+#if targetEnvironment(simulator)
+let minimumConstantBufferOffsetAlignment = 256
+#else
+// Physical Apple-family GPU; retain the bound type's alignment as well.
+let minimumConstantBufferOffsetAlignment = 4
+#endif
+```
 
 ```metal
 #include <metal_stdlib>
