@@ -19,29 +19,21 @@ Here is a **macOS / MSL 3.1 example**, not a default for an arbitrary project. C
 set -eu
 metal_sdk="macosx"
 metal_language="metal3.1"
-metal_library="$PWD/Shaders.diagnostic.metallib"
-if [ -e "$metal_library" ] || [ -L "$metal_library" ]; then
-    printf 'Diagnostic output already exists: %s\n' "$metal_library" >&2
-    exit 1
-fi
-metal_build_dir="$(mktemp -d)"
-trap 'rm -rf "$metal_build_dir"' EXIT
+metal_keep_output=0
+metal_build_dir="$(mktemp -d "${TMPDIR:-/tmp}/metal-diagnostic.XXXXXX")"
+trap 'if [ "$metal_keep_output" -eq 0 ]; then rm -rf "$metal_build_dir"; fi' EXIT
+metal_library="$(cd "$metal_build_dir" && pwd -P)/Shaders.diagnostic.metallib"
 xcrun --sdk "$metal_sdk" metal -std="$metal_language" \
     -c Shaders.metal -o "$metal_build_dir/Shaders.air"
 xcrun --sdk "$metal_sdk" metallib \
-    "$metal_build_dir/Shaders.air" -o "$metal_build_dir/Shaders.metallib"
-if [ -e "$metal_library" ] || [ -L "$metal_library" ]; then
-    printf 'Diagnostic output already exists: %s\n' "$metal_library" >&2
-    exit 1
-fi
-if ! cp -n "$metal_build_dir/Shaders.metallib" "$metal_library"; then
-    printf 'Could not publish diagnostic output: %s\n' "$metal_library" >&2
-    exit 1
-fi
+    "$metal_build_dir/Shaders.air" -o "$metal_library"
+rm "$metal_build_dir/Shaders.air"
+printf '%s\n' "$metal_library"
+metal_keep_output=1
 )
 ```
 
-The subshell removes scratch files on success or failure. It retains `Shaders.diagnostic.metallib` in the current directory after a successful link and copy. It rejects an existing output file, directory, or symlink before compilation and checks again before publication; `cp -n` also prevents replacing an output file created between the final check and copy. Choose a fresh diagnostic output path for another run. The recipe leaves an existing `Shaders.metallib` untouched.
+Each run creates a private, unique directory under `${TMPDIR:-/tmp}`; keep that temporary root outside project source/resource trees. Failed runs remove their directory. Successful runs remove the intermediate `.air`, print the library's absolute path, and retain only `Shaders.diagnostic.metallib` in the run directory for loading and inspection. Repeated or concurrent runs use separate directories and leave libraries in the current directory untouched. After inspection, remove the retained run directory with `rm -rf "/absolute/path/to/metal-diagnostic.XXXXXX"`, replacing the example path with the parent directory of the printed library path.
 
 `metal -c` checks source compilation; `metallib` links the compiled source into a library. Neither creates or executes the app's render/compute pipeline. For an isolated diagnostic involving NaN/Inf or sensitivity to optimizations, compare with `-fno-fast-math` without changing the shipping configuration. Do not silently add `-Werror` or switch the system-wide Xcode selection.
 

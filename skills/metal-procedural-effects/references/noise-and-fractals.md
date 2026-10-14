@@ -6,7 +6,7 @@ Choose a field from its visual and numerical needs. Value noise is a small smoot
 
 Wrap the lattice before hashing to make a periodic field. Applying `fract` to an arbitrary noise input can create a seam. The square-lattice example below supports positive integer periods on either axis, with zero disabling wrapping on that axis. Both values and interpolation derivatives agree at the seams. Keep coordinates finite and within the useful integer/fractional precision of `float`; move the origin near the region being shaded for large worlds.
 
-The following is a complete helper translation unit. It uses a small integer-mixed value field and quintic interpolation, rather than a copied simplex implementation. `pe_value_noise_2d` returns values in `[0, 1)`; this is not a Perlin or simplex algorithm. The fixed nonzero hash salt prevents cell `(0, 0)` from being an absorbing zero. Output is deterministic; keep the salt and octave transforms stable when an asset or effect needs repeatable noise values.
+The following is a complete helper translation unit. It uses a small integer-mixed value field and quintic interpolation, rather than a copied simplex implementation. `pe_value_noise_2d` returns values in `[0, 1)`; this is not a Perlin or simplex algorithm. The fixed nonzero hash salt prevents cell `(0, 0)` from being an absorbing zero. For a given integer cell, the hash and its 24-bit conversion to a power-of-two-scaled float are exact. Interpolation and fBm use floating-point arithmetic: results are repeatable with fixed inputs, implementation, GPU, compiler, and math settings, but bitwise equality across those configurations is not promised. Keep the salt and octave transforms stable when an asset or effect needs repeatable noise values.
 
 ```metal
 #include <metal_stdlib>
@@ -83,5 +83,6 @@ A domain warp changes the sampling footprint. Construct the warped coordinate fi
 - [Gustavson's noise overview](https://stegu.github.io/webgl-noise/) distinguishes the older classic/4D/cellular library from the newer 2D/3D simplex work.
 - [Gustavson and McEwan, Tiling Simplex Noise and Flow Noise](https://jcgt.org/published/0011/01/02/paper.pdf) covers explicit periodicity, rotating-gradient animation, and analytic derivatives. Its 2D simplex grid requires integer x and even-integer y periods; those constraints are specific to that algorithm, not the square-grid helper above.
 - [Author implementation and license](https://github.com/stegu/psrdnoise) and [Ashima/Gustavson license](https://github.com/ashima/webgl-noise/blob/master/LICENSE): preserve their MIT copyright and permission notices if reusing substantial implementation code. Linking to the mathematical source does not make copied code original.
+- [Apple: mathMode](https://developer.apple.com/documentation/metal/mtlcompileoptions/mathmode) and [fastMathEnabled](https://developer.apple.com/documentation/metal/mtlcompileoptions/fastmathenabled) — compiler math settings affect floating-point behavior; select the API supported by the project's SDK.
 
 Sources reviewed 2026-10-13.
