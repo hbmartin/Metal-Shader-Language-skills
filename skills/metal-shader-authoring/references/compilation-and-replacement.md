@@ -11,19 +11,46 @@ metal_sdk="macosx"
 metal_language="metal3.0"
 metal_keep_output=0
 metal_build_dir="$(mktemp -d "${TMPDIR:-/tmp}/metal-diagnostic.XXXXXX")"
-trap 'if [ "$metal_keep_output" -eq 0 ]; then rm -rf "$metal_build_dir"; fi' EXIT
-metal_library="$(cd "$metal_build_dir" && pwd -P)/Shaders.diagnostic.metallib"
+trap 'if [ "$metal_keep_output" -eq 0 ]; then rm -rf -- "$metal_build_dir"; fi' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+metal_run_dir="$(CDPATH= cd -P -- "$metal_build_dir" >/dev/null && pwd -P)"
+metal_library="$metal_run_dir/Shaders.diagnostic.metallib"
 xcrun --sdk "$metal_sdk" metal -std="$metal_language" \
     -c Shaders.metal -o "$metal_build_dir/Shaders.air"
 xcrun --sdk "$metal_sdk" metallib \
     "$metal_build_dir/Shaders.air" -o "$metal_library"
 rm "$metal_build_dir/Shaders.air"
 printf '%s\n' "$metal_library"
+printf 'Retained run directory: %s\n' "$metal_run_dir" >&2
 metal_keep_output=1
 )
 ```
 
-Each run creates a private, unique directory under `${TMPDIR:-/tmp}`; keep that temporary root outside project source/resource trees. Failed runs remove their directory. Successful runs remove the intermediate `.air`, print the library's absolute path, and retain only `Shaders.diagnostic.metallib` in the run directory for loading and inspection. Repeated or concurrent runs use separate directories and leave libraries in the current directory untouched. After inspection, remove the retained run directory with `rm -rf "/absolute/path/to/metal-diagnostic.XXXXXX"`, replacing the example path with the parent directory of the printed library path.
+Each run creates a private, unique directory under `${TMPDIR:-/tmp}`; keep that temporary root outside project source/resource trees. Command failures and handled INT, TERM, or HUP interruptions remove the run directory. Successful runs remove the intermediate `.air`, print one absolute library path on stdout and the labeled absolute run-directory path on stderr, and retain only `Shaders.diagnostic.metallib` for loading and inspection. Repeated or concurrent runs use separate directories and leave libraries in the current directory untouched.
+
+After inspection, copy the printed run-directory path into `metal_run_dir` below. The guard requires an absolute path whose final component is `metal-diagnostic.` followed by six characters, an existing directory, and no symlink at that path. It refuses an empty, parent, or unrelated target.
+
+```sh
+(
+set -eu
+metal_run_dir="/absolute/path/to/metal-diagnostic.XXXXXX"
+metal_cleanup_ok=0
+case "$metal_run_dir" in
+    /*)
+        case "${metal_run_dir##*/}" in
+            metal-diagnostic.??????) metal_cleanup_ok=1 ;;
+        esac
+        ;;
+esac
+if [ "$metal_cleanup_ok" -ne 1 ] || [ ! -d "$metal_run_dir" ] || [ -L "$metal_run_dir" ]; then
+    printf 'Refusing cleanup of run directory: %s\n' "$metal_run_dir" >&2
+    exit 1
+fi
+rm -rf -- "$metal_run_dir"
+)
+```
 
 `metal -c` checks source compilation; `metallib` links the compiled source into a library. Neither creates or executes the app's render/compute pipeline. Load or inspect the retained diagnostic library before removing it.
 
@@ -52,6 +79,7 @@ For arbitrary user-edited shader execution, use an application-appropriate bound
 
 ## Sources
 
+- [POSIX: Shell command language, trap](https://pubs.opengroup.org/onlinepubs/9799919799/utilities/V3_chap02.html#trap) — explicit signal handling and EXIT cleanup.
 - [makeLibrary(source:options:)](https://developer.apple.com/documentation/metal/mtldevice/makelibrary(source:options:)): runtime compilation and include limitation.
 - [MTLCompileOptions](https://developer.apple.com/documentation/metal/mtlcompileoptions): compilation settings and language version.
 - [Metal binary archives](https://developer.apple.com/documentation/metal/metal-binary-archives): pipeline compilation caches.
