@@ -1,7 +1,6 @@
 """Execute the documented examples with temporary fixtures and bounded signal probes."""
 
-import sys
-
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -11,6 +10,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -61,6 +61,9 @@ def cleanup_example(directory, path=DIAGNOSTIC_REFERENCES[0]):
 def snapshot(directory):
     result = {}
     for entry in sorted(directory.iterdir()):
+        # Finder metadata is incidental; dedicated tests inspect it explicitly.
+        if entry.name == ".DS_Store" and entry.is_file() and not entry.is_symlink():
+            continue
         if entry.is_symlink():
             result[entry.name] = ("symlink", os.readlink(entry))
         elif entry.is_dir():
@@ -104,6 +107,13 @@ if name == "mktemp":
         log.write(directory + "\n")
     gate("allocation")
     print(directory, flush=True)
+elif name == "rmdir":
+    directory = Path(args[-1])
+    if directory.is_dir() and not (directory / ".metal-diagnostic-run").exists():
+        if os.environ.get("METAL_TEST_LATE_METADATA"):
+            (directory / ".DS_Store").write_bytes(b"late metadata")
+        gate("rmdir")
+    sys.exit(subprocess.call([os.environ["METAL_TEST_REAL_RMDIR"], *args]))
 elif name == "metal-test-gate":
     gate(args[0])
 else:
@@ -118,6 +128,10 @@ else:
         output.mkdir()
     else:
         output.write_bytes(b"air" if stage == "metal" else b"library")
+    if stage == "metal" and "-MD" in args:
+        (output.parent / "Shaders.d").write_bytes(b"dependency")
+    if os.environ.get("METAL_TEST_METADATA"):
+        (output.parent / ".DS_Store").write_bytes(b"metadata")
     if injection == "unexpected":
         (output.parent / ".unrelated").write_bytes(b"keep me")
     gate(stage)
@@ -148,33 +162,40 @@ class ConsistencyTests(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "posix" and CALLERS, "requires POSIX shells")
 class DiagnosticTests(unittest.TestCase):
-    def setUp(self):
+    @contextmanager
+    def fixture(self):
         self.temp = tempfile.TemporaryDirectory(prefix="metal-reference-tests-", dir="/tmp")
         self.addCleanup(self.temp.cleanup)
-        self.base = Path(self.temp.name).resolve()
-        self.project = self.base / "project with spaces"
-        self.project.mkdir()
-        (self.project / "Shaders.metal").write_text(SHADER)
-        (self.project / "Shaders.diagnostic.metallib").write_bytes(b"project sentinel")
-        self.original_project = snapshot(self.project)
-        self.outputs = self.base / "temporary outputs"
-        self.outputs.mkdir()
-        self.bin = self.base / "bin"
-        self.bin.mkdir()
-        for name in ("xcrun", "mktemp", "metal-test-gate"):
-            executable = self.bin / name
-            executable.write_text("#!" + sys.executable + "\n" + STUB)
-            executable.chmod(0o700)
-        self.env = os.environ.copy()
-        self.env.update(
-            TMPDIR=str(self.outputs),
-            PATH=str(self.bin) + os.pathsep + os.environ.get("PATH", os.defpath),
-            METAL_TEST_REAL_MKTEMP=shutil.which("mktemp") or "/usr/bin/mktemp",
-            METAL_TEST_ALLOCATIONS=str(self.base / "allocations"),
-            METAL_TEST_CALLS=str(self.base / "compiler calls"),
-            METAL_TEST_READY=str(self.base / "ready"),
-            METAL_TEST_RELEASE=str(self.base / "release"),
-        )
+        try:
+            self.base = Path(self.temp.name).resolve()
+            self.project = self.base / "project with spaces"
+            self.project.mkdir()
+            (self.project / "Shaders.metal").write_text(SHADER)
+            (self.project / "Shaders.diagnostic.metallib").write_bytes(b"project sentinel")
+            self.original_project = snapshot(self.project)
+            self.outputs = self.base / "temporary outputs"
+            self.outputs.mkdir()
+            (self.outputs / ".DS_Store").write_bytes(b"fixture metadata")
+            self.bin = self.base / "bin"
+            self.bin.mkdir()
+            for name in ("xcrun", "mktemp", "rmdir", "metal-test-gate"):
+                executable = self.bin / name
+                executable.write_text("#!" + sys.executable + "\n" + STUB)
+                executable.chmod(0o700)
+            self.env = os.environ.copy()
+            self.env.update(
+                TMPDIR=str(self.outputs),
+                PATH=str(self.bin) + os.pathsep + os.environ.get("PATH", os.defpath),
+                METAL_TEST_REAL_MKTEMP=shutil.which("mktemp") or "/usr/bin/mktemp",
+                METAL_TEST_REAL_RMDIR=shutil.which("rmdir") or "/bin/rmdir",
+                METAL_TEST_ALLOCATIONS=str(self.base / "allocations"),
+                METAL_TEST_CALLS=str(self.base / "compiler calls"),
+                METAL_TEST_READY=str(self.base / "ready"),
+                METAL_TEST_RELEASE=str(self.base / "release"),
+            )
+            yield
+        finally:
+            self.doCleanups()
 
     def run_example(self, example, caller=None, env=None, cwd=None):
         return subprocess.run(
@@ -182,10 +203,10 @@ class DiagnosticTests(unittest.TestCase):
             env=env or self.env, capture_output=True, text=True, timeout=12,
         )
 
-    def start_example(self, example, caller, env):
+    def start_example(self, example, caller, env, stderr=subprocess.PIPE):
         process = subprocess.Popen(
             [caller, "-c", example], cwd=self.project, env=env,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            stdout=subprocess.PIPE, stderr=stderr, text=True,
             start_new_session=True,
         )
         self.addCleanup(self.stop_process, process)
@@ -194,8 +215,30 @@ class DiagnosticTests(unittest.TestCase):
     @staticmethod
     def stop_process(process):
         if process.poll() is None:
-            os.killpg(process.pid, signal.SIGKILL)
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        try:
             process.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            # The caller may have exited while a descendant still holds a pipe.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate(timeout=3)
+        finally:
+            for stream in (process.stdout, process.stderr):
+                if stream:
+                    stream.close()
+
+    def allocations(self):
+        log = Path(self.env["METAL_TEST_ALLOCATIONS"])
+        return [Path(line) for line in log.read_text().splitlines()] if log.exists() else []
+
+    def remaining_runs(self):
+        return [path for path in self.allocations() if path.exists() or path.is_symlink()]
 
     def finish(self, process):
         try:
@@ -218,11 +261,7 @@ class DiagnosticTests(unittest.TestCase):
     def release_probe(self):
         Path(self.env["METAL_TEST_RELEASE"]).touch()
 
-    def reset_probe(self):
-        for key in ("METAL_TEST_READY", "METAL_TEST_RELEASE"):
-            Path(self.env[key]).unlink(missing_ok=True)
-
-    def retained_library(self, result):
+    def retained_library(self, result, dependencies=False):
         self.assertEqual(result.returncode, 0, result.stderr)
         lines = result.stdout.splitlines()
         self.assertEqual(len(lines), 1)
@@ -230,44 +269,51 @@ class DiagnosticTests(unittest.TestCase):
         self.assertTrue(library.is_absolute())
         self.assertTrue(library.is_file())
         self.assertEqual(library.parent.parent, self.outputs)
-        self.assertEqual(snapshot(library.parent), {
+        self.assertIn(library.parent, self.allocations())
+        expected = {
             ".metal-diagnostic-run": ("file", MARKER),
             "Shaders.diagnostic.metallib": ("file", b"library"),
-        })
+        }
+        if dependencies:
+            expected["Shaders.d"] = ("file", b"dependency")
+        self.assertEqual(snapshot(library.parent), expected)
         self.assertEqual(stat.S_IMODE(library.parent.stat().st_mode) & 0o077, 0)
         return library
 
     def test_success_repeated_builds_and_cleanup(self):
-        libraries = set()
         for caller in CALLERS:
             for path in DIAGNOSTIC_REFERENCES:
-                with self.subTest(caller=caller, reference=path.name):
-                    result = self.run_example(build_example(path), caller)
-                    library = self.retained_library(result)
-                    self.assertNotIn(library, libraries)
-                    libraries.add(library)
-                    self.assertIn(str(library.parent), result.stderr)
-                    cleanup = cleanup_example(str(library.parent) + "///", path)
-                    self.assertEqual(self.run_example(cleanup, caller).returncode, 0)
-                    self.assertEqual(self.run_example(cleanup, caller).returncode, 0)
-                    self.assertFalse(library.parent.exists())
-        self.assertEqual(snapshot(self.project), self.original_project)
+                with self.subTest(caller=caller, reference=path.name), self.fixture():
+                    libraries = []
+                    for _ in range(2):
+                        result = self.run_example(build_example(path), caller)
+                        library = self.retained_library(result)
+                        libraries.append(library)
+                        self.assertIn("Diagnostic run directory: " + str(library.parent),
+                                      result.stderr)
+                    self.assertNotEqual(libraries[0], libraries[1])
+                    for library in libraries:
+                        cleanup = cleanup_example(str(library.parent) + "///", path)
+                        self.assertEqual(self.run_example(cleanup, caller).returncode, 0)
+                        self.assertEqual(self.run_example(cleanup, caller).returncode, 0)
+                        self.assertFalse(library.parent.exists())
+                    self.assertEqual(snapshot(self.project), self.original_project)
 
     def test_compile_and_link_failures_preserve_status(self):
         for caller in CALLERS:
             for stage, status in (("metal", 42), ("metallib", 43)):
-                with self.subTest(caller=caller, stage=stage):
+                with self.subTest(caller=caller, stage=stage), self.fixture():
                     env = dict(self.env, METAL_TEST_FAIL=stage,
                                METAL_TEST_FAILURE_STATUS=str(status))
                     result = self.run_example(build_example(), caller, env)
                     self.assertEqual(result.returncode, status, result.stderr)
                     self.assertEqual(result.stdout, "")
-                    self.assertEqual(list(self.outputs.iterdir()), [])
+                    self.assertEqual(self.remaining_runs(), [])
                     self.assertEqual(snapshot(self.project), self.original_project)
 
     def test_concurrent_builds_use_separate_directories(self):
         for caller in CALLERS:
-            with self.subTest(caller=caller):
+            with self.subTest(caller=caller), self.fixture():
                 processes = [self.start_example(build_example(), caller, self.env)
                              for _ in range(2)]
                 libraries = []
@@ -279,82 +325,131 @@ class DiagnosticTests(unittest.TestCase):
                 for library in libraries:
                     self.assertEqual(self.run_example(
                         cleanup_example(library.parent), caller).returncode, 0)
-        self.assertEqual(snapshot(self.project), self.original_project)
+                self.assertEqual(snapshot(self.project), self.original_project)
 
     def test_invalid_temporary_roots_allocate_nothing(self):
-        nested = self.project / "temporary"
-        nested.mkdir()
-        alias = self.base / "project alias"
-        alias.symlink_to(self.project, target_is_directory=True)
-        for root in ("relative", "-temporary", str(self.project), str(nested), str(alias)):
-            with self.subTest(root=root):
+        for variant in ("relative", "leading-dash", "project", "nested", "alias"):
+            with self.subTest(root=variant), self.fixture():
+                nested = self.project / "temporary"
+                nested.mkdir()
+                alias = self.base / "project alias"
+                alias.symlink_to(self.project, target_is_directory=True)
+                root = {"relative": "relative", "leading-dash": "-temporary",
+                        "project": str(self.project), "nested": str(nested),
+                        "alias": str(alias)}[variant]
                 result = self.run_example(build_example(), env=dict(self.env, TMPDIR=root))
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, "")
-                self.assertFalse(Path(self.env["METAL_TEST_ALLOCATIONS"]).exists())
-        self.assertEqual(list(self.outputs.iterdir()), [])
-        self.assertEqual((self.project / "Shaders.diagnostic.metallib").read_bytes(),
-                         b"project sentinel")
+                self.assertEqual(self.allocations(), [])
+                self.assertEqual((self.project / "Shaders.diagnostic.metallib").read_bytes(),
+                                 b"project sentinel")
 
     def test_git_project_root_is_used_from_subdirectory(self):
-        if not shutil.which("git"):
-            self.skipTest("git unavailable")
-        subprocess.run(["git", "init", "-q", str(self.project)], check=True,
-                       capture_output=True)
-        subdirectory = self.project / "source"
-        subdirectory.mkdir()
-        root = self.project / "temporary"
-        root.mkdir()
-        result = self.run_example(build_example(), env=dict(self.env, TMPDIR=str(root)),
-                                  cwd=subdirectory)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("outside the project", result.stderr)
-        self.assertFalse(Path(self.env["METAL_TEST_ALLOCATIONS"]).exists())
+        with self.fixture():
+            if not shutil.which("git"):
+                self.skipTest("git unavailable")
+            subprocess.run(["git", "init", "-q", str(self.project)], check=True,
+                           capture_output=True)
+            subdirectory = self.project / "source"
+            subdirectory.mkdir()
+            root = self.project / "temporary"
+            root.mkdir()
+            result = self.run_example(build_example(), env=dict(self.env, TMPDIR=str(root)),
+                                      cwd=subdirectory)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("outside the Git project", result.stderr)
+            self.assertFalse(Path(self.env["METAL_TEST_ALLOCATIONS"]).exists())
 
     def test_temporary_root_symlink_resolves_to_physical_path(self):
-        alias = self.base / "temporary alias"
-        alias.symlink_to(self.outputs, target_is_directory=True)
-        result = self.run_example(build_example(), env=dict(self.env, TMPDIR=str(alias)))
-        library = self.retained_library(result)
-        self.assertEqual(self.run_example(cleanup_example(library.parent)).returncode, 0)
+        with self.fixture():
+            alias = self.base / "temporary alias"
+            alias.symlink_to(self.outputs, target_is_directory=True)
+            result = self.run_example(build_example(), env=dict(self.env, TMPDIR=str(alias)))
+            library = self.retained_library(result)
+            self.assertEqual(self.run_example(cleanup_example(library.parent)).returncode, 0)
 
     def test_unset_temporary_root_falls_back_outside_project(self):
-        env = dict(self.env, METAL_TEST_FAIL="metal")
-        env.pop("TMPDIR", None)
-        result = self.run_example(build_example(), env=env)
-        self.assertEqual(result.returncode, 42, result.stderr)
-        directory = Path(Path(self.env["METAL_TEST_ALLOCATIONS"]).read_text().strip())
-        self.assertEqual(directory.parent, Path("/tmp").resolve())
-        self.assertFalse(directory.exists())
-        self.assertEqual(snapshot(self.project), self.original_project)
+        with self.fixture():
+            env = dict(self.env, METAL_TEST_FAIL="metal")
+            env.pop("TMPDIR", None)
+            result = self.run_example(build_example(), env=env)
+            self.assertEqual(result.returncode, 42, result.stderr)
+            directory = Path(Path(self.env["METAL_TEST_ALLOCATIONS"]).read_text().strip())
+            self.assertEqual(directory.parent, Path("/tmp").resolve())
+            self.assertFalse(directory.exists())
+            self.assertEqual(snapshot(self.project), self.original_project)
 
     def test_stderr_errors_do_not_invalidate_success(self):
         example = build_example().replace("sh <<", "sh 2>&- <<", 1)
         for caller in CALLERS:
-            with self.subTest(caller=caller):
+            with self.subTest(caller=caller), self.fixture():
                 library = self.retained_library(self.run_example(example, caller))
                 self.assertEqual(self.run_example(
                     cleanup_example(library.parent), caller).returncode, 0)
 
+    def test_broken_stderr_pipe_preserves_success_and_failure_status(self):
+        for caller in CALLERS:
+            for outcome in ("success", "failure", "refused-cleanup"):
+                with self.subTest(caller=caller, outcome=outcome), self.fixture():
+                    env = dict(self.env)
+                    if outcome != "success":
+                        env["METAL_TEST_FAIL"] = "metal"
+                    if outcome == "refused-cleanup":
+                        env["METAL_TEST_INJECT"] = "unexpected"
+                    reader, writer = os.pipe()
+                    os.close(reader)
+                    try:
+                        process = self.start_example(build_example(), caller, env, stderr=writer)
+                    finally:
+                        os.close(writer)
+                    stdout, _ = self.finish(process)
+                    if outcome == "success":
+                        result = subprocess.CompletedProcess([], process.returncode, stdout, "")
+                        library = self.retained_library(result)
+                        self.assertEqual(self.run_example(
+                            cleanup_example(library.parent), caller).returncode, 0)
+                    else:
+                        self.assertEqual(process.returncode, 42)
+                        self.assertEqual(stdout, "")
+                        self.assertEqual(len(self.remaining_runs()),
+                                         1 if outcome == "refused-cleanup" else 0)
+
+    def test_directory_is_announced_before_compilation_completes(self):
+        for caller in CALLERS:
+            with self.subTest(caller=caller), self.fixture():
+                process = self.start_example(build_example(), caller, dict(
+                    self.env, METAL_TEST_GATE="metal", METAL_TEST_FAIL="metal"))
+                self.wait_ready(process)
+                directory, = self.allocations()
+                self.assertEqual(process.stderr.readline(),
+                                 "Diagnostic run directory: " + str(directory) + "\n")
+                self.release_probe()
+                stdout, _ = self.finish(process)
+                self.assertEqual(process.returncode, 42)
+                self.assertEqual(stdout, "")
+                self.assertEqual(self.remaining_runs(), [])
+
     def test_stdout_error_retains_completed_outputs(self):
-        example = build_example().replace("sh <<", "sh 1>&- <<", 1)
-        result = self.run_example(example)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(result.stdout, "")
-        directories = list(self.outputs.iterdir())
-        self.assertEqual(len(directories), 1)
-        self.assertEqual(snapshot(directories[0]), {
-            ".metal-diagnostic-run": ("file", MARKER),
-            "Shaders.diagnostic.metallib": ("file", b"library"),
-        })
-        self.assertEqual(self.run_example(cleanup_example(directories[0])).returncode, 0)
+        with self.fixture():
+            example = build_example().replace("sh <<", "sh 1>&- <<", 1)
+            result = self.run_example(example)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
+            directories = self.remaining_runs()
+            self.assertEqual(len(directories), 1)
+            self.assertEqual(snapshot(directories[0]), {
+                ".metal-diagnostic-run": ("file", MARKER),
+                "Shaders.diagnostic.metallib": ("file", b"library"),
+            })
+            self.assertEqual(self.run_example(cleanup_example(directories[0])).returncode, 0)
 
     def test_signals_during_allocation_and_compilation_stop_loops(self):
+        # Simulate terminal cancellation of the whole foreground process group.
+        # Bash SIGINT specifically detects a child that exits numerically instead.
         for caller in CALLERS:
             for phase in ("allocation", "metal", "metallib"):
                 for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-                    with self.subTest(caller=caller, phase=phase, signal=sig.name):
-                        self.reset_probe()
+                    with self.subTest(caller=caller, phase=phase, signal=sig.name), self.fixture():
                         env = dict(self.env, METAL_TEST_GATE=phase)
                         loop = ('for metal_test_run in 1 2 3; do\n'
                                 'printf "RUN %s\\n" "$metal_test_run"\n'
@@ -366,15 +461,16 @@ class DiagnosticTests(unittest.TestCase):
                         stdout, stderr = self.finish(process)
                         self.assertNotEqual(process.returncode, 0, stderr)
                         self.assertEqual(stdout.splitlines(), ["RUN 1"])
-                        self.assertEqual(list(self.outputs.iterdir()), [])
-        self.assertEqual(snapshot(self.project), self.original_project)
+                        self.assertEqual(self.remaining_runs(), [])
+                        self.assertEqual(snapshot(self.project), self.original_project)
 
     def test_diagnostic_process_really_terminates_by_signal(self):
+        # These direct-process assertions independently prove signal re-raising;
+        # outer loops can terminate from the group signal without proving that.
         # Execute the extracted here-document body directly to inspect wait status.
         body = build_example().split("\n", 1)[1].rsplit("METAL_DIAGNOSTIC\n", 1)[0]
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-            with self.subTest(signal=sig.name):
-                self.reset_probe()
+            with self.subTest(signal=sig.name), self.fixture():
                 process = self.start_example(body, shutil.which("sh"),
                                              dict(self.env, METAL_TEST_GATE="metal"))
                 self.wait_ready(process)
@@ -382,7 +478,7 @@ class DiagnosticTests(unittest.TestCase):
                 self.release_probe()
                 self.finish(process)
                 self.assertEqual(process.returncode, -sig)
-                self.assertEqual(list(self.outputs.iterdir()), [])
+                self.assertEqual(self.remaining_runs(), [])
 
     def test_signals_during_final_cleanup_preserve_signal_status(self):
         boundary = "    trap - INT TERM HUP\n"
@@ -393,8 +489,7 @@ class DiagnosticTests(unittest.TestCase):
             boundary, "    metal-test-gate exit-cleanup || :\n" + boundary)
         body = example.split("\n", 1)[1].rsplit("METAL_DIAGNOSTIC\n", 1)[0]
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-            with self.subTest(signal=sig.name):
-                self.reset_probe()
+            with self.subTest(signal=sig.name), self.fixture():
                 process = self.start_example(
                     body, shutil.which("sh"),
                     dict(self.env, METAL_TEST_FAIL="metal",
@@ -404,7 +499,7 @@ class DiagnosticTests(unittest.TestCase):
                 self.release_probe()
                 self.finish(process)
                 self.assertEqual(process.returncode, -sig)
-                self.assertEqual(list(self.outputs.iterdir()), [])
+                self.assertEqual(self.remaining_runs(), [])
 
     def test_publication_interrupts_retain_completed_library(self):
         publication = "printf '%s\\n' \"$metal_library\"\n"
@@ -412,8 +507,7 @@ class DiagnosticTests(unittest.TestCase):
         for caller in CALLERS:
             for position in ("before", "after"):
                 for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-                    with self.subTest(caller=caller, position=position, signal=sig.name):
-                        self.reset_probe()
+                    with self.subTest(caller=caller, position=position, signal=sig.name), self.fixture():
                         probe = "metal-test-gate publication\n"
                         replacement = (probe + publication if position == "before"
                                        else publication + probe)
@@ -423,9 +517,9 @@ class DiagnosticTests(unittest.TestCase):
                         self.wait_ready(process)
                         os.killpg(process.pid, sig)
                         self.release_probe()
-                        stdout, _ = self.finish(process)
+                        stdout, stderr = self.finish(process)
                         self.assertNotEqual(process.returncode, 0)
-                        directories = list(self.outputs.iterdir())
+                        directories = self.remaining_runs()
                         self.assertEqual(len(directories), 1)
                         library = directories[0] / "Shaders.diagnostic.metallib"
                         self.assertEqual(library.read_bytes(), b"library")
@@ -433,6 +527,7 @@ class DiagnosticTests(unittest.TestCase):
                                          MARKER)
                         self.assertEqual(stdout.splitlines(),
                                          [str(library)] if position == "after" else [])
+                        self.assertIn("Diagnostic run directory: " + str(library.parent), stderr)
                         self.assertEqual(self.run_example(
                             cleanup_example(directories[0]), caller).returncode, 0)
 
@@ -449,8 +544,10 @@ class DiagnosticTests(unittest.TestCase):
                     "visible-file", "hidden-file", "nested-directory")
         for caller in CALLERS:
             for variant in variants:
-                with self.subTest(caller=caller, variant=variant):
+                with self.subTest(caller=caller, variant=variant), self.fixture():
                     directory = self.make_run(name="metal-diagnostic.backup")
+                    (directory / ".DS_Store").write_bytes(b"metadata")
+                    (directory / "Shaders.d").write_bytes(b"dependency")
                     marker = directory / ".metal-diagnostic-run"
                     if variant == "missing-marker":
                         marker.unlink()
@@ -472,12 +569,13 @@ class DiagnosticTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 1, result.stderr)
                     self.assertIn("Refusing cleanup", result.stderr)
                     self.assertEqual(snapshot(directory), before)
-                    shutil.rmtree(directory)
+                    self.assertEqual((directory / ".DS_Store").read_bytes(), b"metadata")
 
     def test_cleanup_refuses_symlinks_without_changing_targets(self):
         for caller in CALLERS:
-            for variant in ("directory", "marker", "library", "dangling-air"):
-                with self.subTest(caller=caller, variant=variant):
+            for variant in ("directory", "marker", "library", "dangling-air",
+                            "metadata", "dependency"):
+                with self.subTest(caller=caller, variant=variant), self.fixture():
                     directory = self.make_run()
                     victim = self.base / "victim"
                     victim.write_bytes(MARKER)
@@ -490,6 +588,8 @@ class DiagnosticTests(unittest.TestCase):
                             "marker": ".metal-diagnostic-run",
                             "library": "Shaders.diagnostic.metallib",
                             "dangling-air": "Shaders.air",
+                            "metadata": ".DS_Store",
+                            "dependency": "Shaders.d",
                         }[variant]
                         entry.unlink(missing_ok=True)
                         entry.symlink_to(victim if variant != "dangling-air"
@@ -499,152 +599,170 @@ class DiagnosticTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 1)
                     self.assertEqual(snapshot(directory), before)
                     self.assertEqual(victim.read_bytes(), MARKER)
-                    if path.is_symlink():
-                        path.unlink()
-                    shutil.rmtree(directory)
-                    victim.unlink()
 
     def test_cleanup_rejects_malformed_paths(self):
-        directory = self.make_run()
-        inputs = ("", "/", ".", "relative/metal-diagnostic.abc123",
-                  str(self.outputs / "metal-diagnostic.too-long"),
-                  str(self.outputs) + "/./" + directory.name,
-                  str(self.outputs) + "/../temporary outputs/" + directory.name,
-                  str(directory) + "/.")
-        before = snapshot(directory)
-        for path in inputs:
-            with self.subTest(path=path):
+        for variant in ("empty", "root", "dot", "relative", "long", "dot-component",
+                        "parent-component", "trailing-dot"):
+            with self.subTest(path=variant), self.fixture():
+                directory = self.make_run()
+                path = {"empty": "", "root": "/", "dot": ".",
+                        "relative": "relative/metal-diagnostic.abc123",
+                        "long": str(self.outputs / "metal-diagnostic.too-long"),
+                        "dot-component": str(self.outputs) + "/./" + directory.name,
+                        "parent-component": str(self.outputs) + "/../temporary outputs/" + directory.name,
+                        "trailing-dot": str(directory) + "/."}[variant]
+                before = snapshot(directory)
                 self.assertEqual(self.run_example(cleanup_example(path)).returncode, 1)
                 self.assertEqual(snapshot(directory), before)
 
     def test_cleanup_accepts_known_intermediate(self):
-        directory = self.make_run()
-        (directory / "Shaders.air").write_bytes(b"air")
-        self.assertEqual(self.run_example(cleanup_example(directory)).returncode, 0)
-        self.assertFalse(directory.exists())
+        with self.fixture():
+            directory = self.make_run()
+            (directory / "Shaders.air").write_bytes(b"air")
+            self.assertEqual(self.run_example(cleanup_example(directory)).returncode, 0)
+            self.assertFalse(directory.exists())
+
+    def test_metadata_and_dependencies_are_known_outputs(self):
+        example = build_example().replace("-c Shaders.metal", "-MD -c Shaders.metal")
+        for caller in CALLERS:
+            for outcome in ("success", "failure"):
+                with self.subTest(caller=caller, outcome=outcome), self.fixture():
+                    env = dict(self.env, METAL_TEST_METADATA="1")
+                    if outcome == "failure":
+                        env["METAL_TEST_FAIL"] = "metal"
+                    result = self.run_example(example, caller, env)
+                    if outcome == "success":
+                        library = self.retained_library(result, dependencies=True)
+                        self.assertEqual((library.parent / ".DS_Store").read_bytes(), b"metadata")
+                        self.assertEqual(self.run_example(
+                            cleanup_example(library.parent), caller).returncode, 0)
+                    else:
+                        self.assertEqual(result.returncode, 42)
+                        self.assertEqual(result.stdout, "")
+                    self.assertEqual(self.remaining_runs(), [])
+
+    def test_known_side_files_must_be_regular(self):
+        for name in (".DS_Store", "Shaders.d"):
+            with self.subTest(name=name), self.fixture():
+                directory = self.make_run()
+                (directory / name).mkdir()
+                (directory / name / "notes").write_bytes(b"unrelated")
+                before = snapshot(directory)
+                self.assertEqual(self.run_example(cleanup_example(directory)).returncode, 1)
+                self.assertEqual(snapshot(directory), before)
+
+    def test_empty_markerless_cleanup_and_repetition(self):
+        for caller in CALLERS:
+            with self.subTest(caller=caller), self.fixture():
+                directory = self.outputs / "metal-diagnostic.abc123"
+                directory.mkdir()
+                for _ in range(2):
+                    self.assertEqual(self.run_example(
+                        cleanup_example(str(directory) + "///"), caller).returncode, 0)
+                    self.assertFalse(directory.exists())
+
+    def test_interrupted_cleanup_recovers_empty_target(self):
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(signal=sig.name), self.fixture():
+                directory = self.make_run()
+                process = self.start_example(cleanup_example(directory), CALLERS[0],
+                                             dict(self.env, METAL_TEST_GATE="rmdir"))
+                self.wait_ready(process)
+                self.assertFalse((directory / ".metal-diagnostic-run").exists())
+                os.killpg(process.pid, sig)
+                self.release_probe()
+                self.finish(process)
+                self.assertNotEqual(process.returncode, 0)
+                self.assertTrue(directory.is_dir())
+                self.assertEqual(snapshot(directory), {})
+                self.assertEqual(self.run_example(cleanup_example(directory)).returncode, 0)
+                self.assertFalse(directory.exists())
+
+    def test_late_metadata_after_marker_removal_requires_inspected_recovery(self):
+        with self.fixture():
+            directory = self.make_run()
+            first = self.run_example(cleanup_example(directory),
+                                     env=dict(self.env, METAL_TEST_LATE_METADATA="1"))
+            self.assertNotEqual(first.returncode, 0)
+            self.assertFalse((directory / ".metal-diagnostic-run").exists())
+            self.assertFalse((directory / "Shaders.diagnostic.metallib").exists())
+            metadata = directory / ".DS_Store"
+            self.assertEqual(metadata.read_bytes(), b"late metadata")
+            self.assertEqual(self.run_example(cleanup_example(directory)).returncode, 1)
+            self.assertEqual(metadata.read_bytes(), b"late metadata")
+
+    def test_working_directory_boundary_without_git(self):
+        for location in ("temporary-root", "project-root", "project-subdirectory"):
+            with self.subTest(location=location), self.fixture():
+                git = self.bin / "git"
+                git.write_text("#!/bin/sh\nexit 1\n")
+                git.chmod(0o700)
+                if location == "temporary-root":
+                    cwd, root = self.outputs, self.outputs
+                else:
+                    root = self.project / "temporary"
+                    root.mkdir()
+                    cwd = self.project
+                    if location == "project-subdirectory":
+                        cwd = self.project / "source"
+                        cwd.mkdir()
+                        (cwd / "Shaders.metal").write_text(SHADER)
+                result = self.run_example(build_example(), cwd=cwd,
+                                          env=dict(self.env, TMPDIR=str(root)))
+                if location == "project-subdirectory":
+                    # This is the documented limit of the working-directory fallback.
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    library = Path(result.stdout.strip())
+                    self.assertEqual(library.parent.parent, root)
+                    self.assertEqual(self.run_example(cleanup_example(library.parent)).returncode, 0)
+                else:
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn("outside the working directory (" + str(cwd) + ")", result.stderr)
+                    self.assertEqual(self.allocations(), [])
+
+    def test_failed_subcase_cannot_contaminate_next_fixture(self):
+        bases, processes = [], []
+
+        class FailingSubcases(DiagnosticTests):
+            def exercise(self):
+                for index in range(2):
+                    with self.subTest(index=index), self.fixture():
+                        bases.append(self.base)
+                        self.make_run()  # Reuse a fixed name in independently owned fixtures.
+                        if index == 0:
+                            process = self.start_example(build_example(), CALLERS[0],
+                                                         dict(self.env, METAL_TEST_GATE="allocation"))
+                            processes.append(process)
+                            self.wait_ready(process)
+                            self.fail("injected first-subcase failure")
+                        self.assertFalse(bases[0].exists())
+                        self.assertIsNotNone(processes[0].poll())
+                        self.assertTrue(processes[0].stdout.closed)
+
+        result = unittest.TestResult()
+        FailingSubcases("exercise").run(result)
+        self.assertEqual(len(result.failures), 1)
+        self.assertEqual(result.errors, [])
+        self.assertEqual(len(bases), 2)
+        self.assertNotEqual(bases[0], bases[1])
+        self.assertTrue(all(not base.exists() for base in bases))
 
     def test_automatic_cleanup_refuses_unexpected_entries_and_symlinks(self):
-        victim = self.base / "victim"
-        victim.write_bytes(b"unrelated")
         for variant in ("unexpected", "symlink", "directory"):
-            with self.subTest(variant=variant):
+            with self.subTest(variant=variant), self.fixture():
+                victim = self.base / "victim"
+                victim.write_bytes(b"unrelated")
                 result = self.run_example(build_example(), env=dict(
                     self.env, METAL_TEST_FAIL="metal", METAL_TEST_INJECT=variant,
                     METAL_TEST_VICTIM=str(victim)))
                 self.assertEqual(result.returncode, 42)
                 self.assertIn("Refusing or unable to clean", result.stderr)
-                directories = list(self.outputs.iterdir())
+                directories = self.remaining_runs()
                 self.assertEqual(len(directories), 1)
                 directory = directories[0]
                 self.assertEqual((directory / ".metal-diagnostic-run").read_bytes(), MARKER)
                 self.assertTrue((directory / "Shaders.air").exists())
                 self.assertEqual(victim.read_bytes(), b"unrelated")
-                shutil.rmtree(directory)
-
-
-class ToolchainTests(unittest.TestCase):
-    def sdk(self, name):
-        if not shutil.which("xcrun"):
-            self.skipTest("Xcode SDKs unavailable: xcrun not installed")
-        result = subprocess.run(["xcrun", "--sdk", name, "--show-sdk-path"],
-                                capture_output=True, text=True, timeout=20)
-        if result.returncode:
-            self.skipTest(f"{name} SDK unavailable: {result.stderr.strip()}")
-        return result.stdout.strip()
-
-    def targets(self):
-        return (
-            ("macosx", "arm64-apple-macosx14.0"),
-            ("macosx", "x86_64-apple-macosx14.0"),
-            ("macosx", "arm64-apple-ios17.0-macabi"),
-            ("macosx", "x86_64-apple-ios17.0-macabi"),
-            ("iphonesimulator", "arm64-apple-ios17.0-simulator"),
-            ("iphonesimulator", "x86_64-apple-ios17.0-simulator"),
-        )
-
-    def test_swift_alignment_typechecks_for_every_target(self):
-        compiler = shutil.which("swiftc")
-        if not compiler:
-            self.skipTest("swiftc unavailable")
-        with tempfile.TemporaryDirectory(prefix="metal-swift-tests-", dir="/tmp") as temp:
-            source = Path(temp) / "Alignment.swift"
-            source.write_text(block(ALIGNMENT_REFERENCES[0], "swift",
-                                    "constantBufferOffsetAlignment"))
-            for sdk_name, target in self.targets():
-                with self.subTest(target=target):
-                    result = subprocess.run(
-                        [compiler, "-typecheck", "-target", target, "-sdk",
-                         self.sdk(sdk_name), str(source)],
-                        capture_output=True, text=True, timeout=30,
-                    )
-                    self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_swift_alignment_policy_value(self):
-        compiler = shutil.which("swiftc")
-        if not compiler:
-            self.skipTest("swiftc unavailable")
-        with tempfile.TemporaryDirectory(prefix="metal-swift-value-", dir="/tmp") as temp:
-            source = Path(temp) / "Alignment.swift"
-            binary = Path(temp) / "alignment"
-            source.write_text(block(ALIGNMENT_REFERENCES[0], "swift",
-                                    "constantBufferOffsetAlignment")
-                              + "print(constantBufferOffsetAlignment)\n")
-            result = subprocess.run([compiler, str(source), "-o", str(binary)],
-                                    capture_output=True, text=True, timeout=30)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=5)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout, "256\n")
-
-    def test_c_and_objective_c_alignment_for_every_target(self):
-        compiler = shutil.which("clang")
-        if not compiler:
-            self.skipTest("clang unavailable")
-        source = (block(ALIGNMENT_REFERENCES[0], "c", "constantBufferOffsetAlignment")
-                  + '_Static_assert(constantBufferOffsetAlignment == 256, "alignment policy");\n')
-        for sdk_name, target in self.targets():
-            for language in ("c", "objective-c"):
-                with self.subTest(target=target, language=language):
-                    result = subprocess.run(
-                        [compiler, "-fsyntax-only", "-target", target, "-isysroot",
-                         self.sdk(sdk_name), "-x", language, "-"],
-                        input=source, capture_output=True, text=True, timeout=20,
-                    )
-                    self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_real_metal_compile_and_link(self):
-        self.sdk("macosx")
-        for tool in ("metal", "metallib"):
-            available = subprocess.run(["xcrun", "--sdk", "macosx", "--find", tool],
-                                       capture_output=True, text=True, timeout=20)
-            if available.returncode:
-                self.skipTest(f"{tool} unavailable: {available.stderr.strip()}")
-        with tempfile.TemporaryDirectory(prefix="metal-real-build-", dir="/tmp") as temp:
-            base = Path(temp).resolve()
-            project = base / "source"
-            project.mkdir()
-            (project / "Shaders.metal").write_text(SHADER)
-            outputs = base / "outputs"
-            outputs.mkdir()
-            env = dict(os.environ, TMPDIR=str(outputs))
-            result = subprocess.run(
-                [shutil.which("sh"), "-c", build_example()], cwd=project, env=env,
-                capture_output=True, text=True, timeout=60,
-            )
-            if result.returncode and "missing Metal Toolchain" in result.stderr:
-                self.skipTest(result.stderr.strip())
-            self.assertEqual(result.returncode, 0, result.stderr)
-            library = Path(result.stdout.strip())
-            self.assertTrue(library.is_file())
-            self.assertGreater(library.stat().st_size, 0)
-            self.assertEqual({entry.name for entry in library.parent.iterdir()},
-                             {"Shaders.diagnostic.metallib", ".metal-diagnostic-run"})
-            cleanup = subprocess.run(
-                [shutil.which("sh"), "-c", cleanup_example(library.parent)],
-                cwd=project, env=env, capture_output=True, text=True, timeout=5,
-            )
-            self.assertEqual(cleanup.returncode, 0, cleanup.stderr)
-            self.assertFalse(library.parent.exists())
 
 
 if __name__ == "__main__":
