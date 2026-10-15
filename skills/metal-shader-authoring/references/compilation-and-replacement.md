@@ -172,13 +172,32 @@ for metal_entry in "$metal_run_dir"/* "$metal_run_dir"/.[!.]* "$metal_run_dir"/.
         *) metal_refuse_cleanup ;;
     esac
 done
-rm -f -- "$metal_run_dir/Shaders.air" "$metal_run_dir/Shaders.diagnostic.metallib" \
-    "$metal_run_dir/Shaders.d" "$metal_run_dir/.DS_Store" "$metal_marker"
-rmdir -- "$metal_run_dir"
+# Finish this short deletion phase before honoring cancellation.
+metal_pending_signal=
+metal_record_signal() {
+    [ -n "$metal_pending_signal" ] || metal_pending_signal="$1"
+}
+trap 'metal_record_signal INT' INT
+trap 'metal_record_signal TERM' TERM
+trap 'metal_record_signal HUP' HUP
+metal_cleanup_status=0
+(
+    trap '' INT TERM HUP
+    rm -f -- "$metal_run_dir/Shaders.air" "$metal_run_dir/Shaders.diagnostic.metallib" \
+        "$metal_run_dir/Shaders.d" "$metal_run_dir/.DS_Store" "$metal_marker" &&
+    rmdir -- "$metal_run_dir"
+) || metal_cleanup_status=$?
+trap - INT TERM HUP
+case "$metal_pending_signal" in
+    INT) kill -s INT "$$"; exit 130 ;;
+    TERM) kill -s TERM "$$"; exit 143 ;;
+    HUP) kill -s HUP "$$"; exit 129 ;;
+esac
+exit "$metal_cleanup_status"
 METAL_CLEANUP
 ```
 
-Legacy runs created without a marker and interrupted cleanup can leave markerless directories, including empty ones. Normal cleanup refuses every existing markerless target. Recovery is operator-managed: select the path explicitly, inspect its directory metadata and entries, and compare them with your own run history before deciding how to handle it. This separate example only lists the selected path; it does not delete anything or establish ownership.
+Legacy runs created without a marker and interrupted cleanup can leave markerless directories, including empty ones. Normal cleanup refuses every existing markerless target. Recovery is operator-managed: select the path explicitly, inspect its directory metadata and entries, and compare them with your own run history before deciding how to handle it. Do not create a marker to bypass a refusal or substitute recursive deletion for inspection and operator-managed recovery. This separate example refuses symlink targets and dot/parent path components, then only lists the selected directory; it does not delete anything or establish ownership.
 
 ```sh
 sh <<'METAL_INSPECT'
@@ -191,12 +210,25 @@ case "${metal_inspect_dir:-}" in
     /*) ;;
     *) metal_stderr 'Inspection path must be absolute and nonempty\n'; exit 1 ;;
 esac
+while [ "$metal_inspect_dir" != / ] && [ "${metal_inspect_dir%/}" != "$metal_inspect_dir" ]; do
+    metal_inspect_dir="${metal_inspect_dir%/}"
+done
+case "$metal_inspect_dir" in
+    */./*|*/../*|*/.|*/..)
+        metal_stderr 'Inspection path must not contain dot or parent components: %s\n' "$metal_inspect_dir"
+        exit 1
+        ;;
+esac
+if [ -L "$metal_inspect_dir" ] || [ ! -d "$metal_inspect_dir" ]; then
+    metal_stderr 'Inspection requires an existing nonsymlink directory: %s\n' "$metal_inspect_dir"
+    exit 1
+fi
 ls -ld -- "$metal_inspect_dir"
 ls -la -- "$metal_inspect_dir"
 METAL_INSPECT
 ```
 
-An interruption or concurrent file creation between removing the marker and `rmdir` can leave a target that normal cleanup will refuse. Repeating cleanup succeeds for an already-absent valid target; existing markerless leftovers need the inspection above and operator-managed recovery.
+After validation, manual cleanup records INT, TERM, and HUP while its deletion subprocess ignores them. It finishes the named-file removal and `rmdir`, then terminates by the first recorded signal. Without cancellation, cleanup preserves its command status and native error messages. This short deferral reduces interruption leftovers; concurrent file creation, filesystem errors, or uncatchable termination can still leave a markerless target that normal cleanup will refuse. Repeating cleanup succeeds for an already-absent valid target; existing markerless leftovers need the inspection above and operator-managed recovery.
 
 `metal -c` checks source compilation; `metallib` links the compiled source into a library. Neither creates or executes the app's render/compute pipeline. Load or inspect the retained diagnostic library before removing it.
 
@@ -231,4 +263,4 @@ For arbitrary user-edited shader execution, use an application-appropriate bound
 - [Metal binary archives](https://developer.apple.com/documentation/metal/metal-binary-archives): pipeline compilation caches.
 - [Building with embedded shader sources](https://developer.apple.com/documentation/xcode/building-your-project-with-embedded-shader-sources): shader inspection builds.
 
-Sources reviewed 2026-10-14. Use the classic `MTLDevice`/pipeline path; newer Metal compiler/submission APIs are outside this collection.
+Sources reviewed 2026-10-15. Use the classic `MTLDevice`/pipeline path; newer Metal compiler/submission APIs are outside this collection.
