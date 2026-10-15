@@ -21,7 +21,7 @@ kernel void map_double(
 
 For this four-byte count, prefer `setBytes(_:length:index:)` with length 4 at index 2 to let Metal copy the scalar without a caller-managed buffer offset. If suballocating constants from an `MTLBuffer`, retain both type alignment and binding-offset alignment.
 
-For a portable constant-buffer suballocation policy, use 256-byte binding offsets on every target, including Intel/AMD Macs, Apple silicon Macs, Mac Catalyst, and Simulator. This is a conservative allocator policy, not the hardware minimum on every GPU or a change to MSL type alignment. Apple-family GPUs list a 4-byte minimum constant-buffer offset alignment; Simulator requires 256 bytes even when it reports Apple-family capabilities. Retain the bound type's alignment as well. Choosing a smaller hardware minimum is a separate optimization based on the selected runtime device and environment, not the CPU architecture.
+For a portable constant-buffer suballocation policy, use 256-byte binding offsets on every target, including Intel/AMD Macs, Apple silicon Macs, Mac Catalyst, and Simulator. This is a conservative allocator policy, not the hardware minimum on every GPU or a change to MSL type alignment. Apple-family GPUs list a 4-byte minimum constant-buffer offset alignment; Simulator requires 256 bytes even when it reports Apple-family capabilities. Retain the bound type's alignment as well.
 
 ```swift
 let constantBufferOffsetAlignment = 256
@@ -91,4 +91,4 @@ The dimensional thread built-ins in this one-dimensional signature all use scala
 - [Apple: setThreadgroupMemoryLength](https://developer.apple.com/documentation/metal/mtlcomputecommandencoder/setthreadgroupmemorylength(_:index:)) — dynamic memory lengths are multiples of 16 bytes.
 - [Apple: MSL specification](https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf) — vector layout, kernel built-ins, barrier participation, atomics, and fragment-only derivatives. The canonical specification includes newer language features; use only those supported by the project's pre-4 language target.
 
-Sources reviewed 2026-10-13.
+Sources reviewed 2026-10-14.

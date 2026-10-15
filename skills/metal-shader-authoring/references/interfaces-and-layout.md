@@ -36,7 +36,7 @@ Host buffer 0 must contain at least `count` float4 elements. For this struct, `t
 - On Swift hosts, check `MemoryLayout` stride/alignment and actual field offsets, not only size. On C/C++ hosts, use the appropriate SIMD/shared declarations and static assertions. Never make a Swift `Bool` or an arbitrary host enum part of an unverified GPU ABI.
 - Type alignment and binding-offset alignment are separate constraints. For directly bound device buffers, retain the pointed-to type's alignment; constant-buffer offsets must also meet the target GPU/environment's minimum binding alignment. Consult the selected encoder API and applicable feature tables. An allocator's 256-byte convention is not a universal MSL struct-alignment rule.
 
-For a portable constant-buffer suballocation policy, use 256-byte binding offsets on every target, including Intel/AMD Macs, Apple silicon Macs, Mac Catalyst, and Simulator. This is a conservative allocator policy, not the hardware minimum on every GPU or a change to MSL type alignment. Apple-family GPUs list a 4-byte minimum constant-buffer offset alignment; Simulator requires 256 bytes even when it reports Apple-family capabilities. Retain the bound type's alignment as well. Choosing a smaller hardware minimum is a separate optimization based on the selected runtime device and environment, not the CPU architecture.
+For a portable constant-buffer suballocation policy, use 256-byte binding offsets on every target, including Intel/AMD Macs, Apple silicon Macs, Mac Catalyst, and Simulator. This is a conservative allocator policy, not the hardware minimum on every GPU or a change to MSL type alignment. Apple-family GPUs list a 4-byte minimum constant-buffer offset alignment; Simulator requires 256 bytes even when it reports Apple-family capabilities. Retain the bound type's alignment as well.
 
 ```swift
 let constantBufferOffsetAlignment = 256
@@ -62,4 +62,4 @@ Procedural UV normalization should use actual drawable/texture pixel dimensions,
 - [setBuffer(_:offset:index:)](https://developer.apple.com/documentation/metal/mtlcomputecommandencoder/setbuffer(_:offset:index:)) and [Metal feature tables](https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf): type alignment and target-specific constant-buffer binding offsets.
 - [Developing Metal apps that run in Simulator](https://developer.apple.com/documentation/metal/developing-metal-apps-that-run-in-simulator): Simulator-specific constant-buffer offset restrictions.
 
-Sources reviewed 2026-10-13. Examples are original, and their ABI is part of the example's explicit contract.
+Sources reviewed 2026-10-14. Examples are original, and their ABI is part of the example's explicit contract.

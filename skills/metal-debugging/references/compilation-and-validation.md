@@ -26,11 +26,17 @@ case "$metal_temp_root" in
     *) printf 'Temporary root must be absolute: %s\n' "$metal_temp_root" >&2; exit 1 ;;
 esac
 metal_temp_root="$(CDPATH= cd -P -- "$metal_temp_root" && pwd -P)"
-metal_project_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)"
+if metal_project_root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    metal_boundary_name="Git project"
+else
+    metal_project_root="$(pwd -P)"
+    metal_boundary_name="working directory"
+fi
 metal_project_root="$(CDPATH= cd -P -- "$metal_project_root" && pwd -P)"
 case "$metal_temp_root/" in
     "${metal_project_root%/}/"*)
-        printf 'Temporary root must be outside the project: %s\n' "$metal_temp_root" >&2
+        printf 'Temporary root must be outside the %s (%s): %s\n' \
+            "$metal_boundary_name" "$metal_project_root" "$metal_temp_root" >&2
         exit 1
         ;;
 esac
@@ -47,13 +53,14 @@ metal_cleanup() {
     for metal_entry in "$metal_build_dir"/* "$metal_build_dir"/.[!.]* "$metal_build_dir"/..?*; do
         [ -e "$metal_entry" ] || [ -L "$metal_entry" ] || continue
         case "${metal_entry##*/}" in
-            Shaders.air|Shaders.diagnostic.metallib|.metal-diagnostic-run)
+            Shaders.air|Shaders.d|Shaders.diagnostic.metallib|.DS_Store|.metal-diagnostic-run)
                 [ -f "$metal_entry" ] && [ ! -L "$metal_entry" ] || return 1
                 ;;
             *) return 1 ;;
         esac
     done
     rm -f -- "$metal_build_dir/Shaders.air" "$metal_build_dir/Shaders.diagnostic.metallib" \
+        "$metal_build_dir/Shaders.d" "$metal_build_dir/.DS_Store" \
         "$metal_build_dir/.metal-diagnostic-run" || return 1
     rmdir -- "$metal_build_dir"
 }
@@ -62,7 +69,8 @@ metal_on_exit() {
     metal_abort_if_signalled
     trap - EXIT
     metal_cleanup || {
-        printf 'Refusing or unable to clean run directory: %s\n' "$metal_build_dir" >&2 || :
+        (trap '' PIPE; printf 'Refusing or unable to clean run directory: %s\n' \
+            "$metal_build_dir") >&2 || :
     }
     trap - INT TERM HUP
     metal_abort_if_signalled
@@ -83,7 +91,8 @@ metal_abort_if_signalled() {
     esac
     metal_keep_output="$metal_signal_keep_output"
     metal_cleanup || {
-        printf 'Refusing or unable to clean run directory: %s\n' "$metal_build_dir" >&2 || :
+        (trap '' PIPE; printf 'Refusing or unable to clean run directory: %s\n' \
+            "$metal_build_dir") >&2 || :
     }
     trap - EXIT INT TERM HUP
     # Re-raise after the recording trap has returned, including on macOS sh.
@@ -99,9 +108,9 @@ metal_build_dir="$(trap '' INT TERM HUP; mktemp -d -- "$metal_temp_root/metal-di
 metal_abort_if_signalled
 printf 'metal-diagnostic-v1\n' > "$metal_build_dir/.metal-diagnostic-run"
 metal_abort_if_signalled
-metal_run_dir="$(CDPATH= cd -P -- "$metal_build_dir" && pwd -P)"
+(trap '' PIPE; printf 'Diagnostic run directory: %s\n' "$metal_build_dir") >&2 || :
 metal_abort_if_signalled
-metal_library="$metal_run_dir/Shaders.diagnostic.metallib"
+metal_library="$metal_build_dir/Shaders.diagnostic.metallib"
 xcrun --sdk "$metal_sdk" metal -std="$metal_language" \
     -c Shaders.metal -o "$metal_build_dir/Shaders.air"
 metal_abort_if_signalled
@@ -115,15 +124,20 @@ metal_keep_output=1
 metal_abort_if_signalled
 printf '%s\n' "$metal_library"
 metal_abort_if_signalled
-printf 'Retained run directory: %s\n' "$metal_run_dir" >&2 || :
 METAL_DIAGNOSTIC
 ```
 
-Each run launches a separate `sh` process and creates a private, unique directory under the physical path of `${TMPDIR:-/tmp}`. Relative temporary roots and roots inside the project are refused; Git identifies the project root when available, otherwise the working directory is used. Keep diagnostic outputs temporary and outside source/resource trees; never commit them. The marker `.metal-diagnostic-run` identifies this recipe's directories. Signal traps record INT, TERM, and HUP requests; cleanup and re-raising happen at command boundaries after the recording trap returns. The allocating child ignores those signals until it returns its directory path, so pending cancellation can remove the allocated directory. The diagnostic process then terminates by the original signal so a surrounding bash loop stops.
+Keep the closing `METAL_DIAGNOSTIC` and `METAL_CLEANUP` delimiters unindented when inserting these blocks into a function or conditional; leading spaces prevent the shell from recognizing a heredoc delimiter.
 
-Before retention, command failures and handled interruptions remove only known outputs and the empty run directory. Unexpected entries or symlinks cause cleanup to refuse the directory. Successful runs remove `Shaders.air`, commit retention, then print one absolute library path on stdout and the labeled absolute run-directory path on stderr. The stderr annotation is best-effort. After retention, output errors or signals leave `Shaders.diagnostic.metallib` and the marker available for loading and inspection, including when a path has already been printed. Repeated or concurrent runs use separate directories and leave libraries in the current directory untouched.
+Each run launches a separate `sh` process and creates a private, unique directory under the physical path of `${TMPDIR:-/tmp}`. Relative temporary roots are refused. The boundary is the Git project root when available, otherwise the working directory; roots equal to or inside that boundary are refused. Without a discoverable Git root, run from the project root: the recipe cannot identify a non-Git project's ancestor root from a subdirectory. Running from the temporary root itself also fails this check because it equals the working-directory boundary. Keep diagnostic outputs temporary and outside source/resource trees; never commit them.
 
-After inspection, copy the printed run-directory path into `metal_run_dir` below. Cleanup accepts trailing slashes and succeeds when a valid target is already absent. Existing targets must be nonsymlink directories with this recipe's exact marker and only regular, nonsymlink known outputs; all entries are checked before anything is deleted. A matching folder name alone does not establish ownership. Cleanup removes only the known files and uses `rmdir` to remove the empty directory; it never recursively deletes other contents.
+The marker `.metal-diagnostic-run` identifies this recipe's directories. Signal traps record INT, TERM, and HUP requests; cleanup and re-raising happen at command boundaries after the recording trap returns. The allocating child ignores those signals until it returns its directory path, so pending cancellation can remove the allocated directory. The diagnostic process then terminates by the original signal. This preserves bash's Ctrl-C behavior when a terminal interrupt reaches both the caller and diagnostic process.
+
+After allocation and marker creation, stderr announces `Diagnostic run directory: <absolute path>` before compilation. This annotation is best-effort: a closed descriptor or broken pipe does not fail the build or add text to stdout. Before retention, command failures and handled interruptions remove only known outputs and the empty run directory. Known files include regular, nonsymlink `.DS_Store` metadata and `Shaders.d` dependency output produced by an added `-MD` flag. Other entries or symlinks cause cleanup to refuse the directory.
+
+Successful runs remove `Shaders.air`, commit retention, then print one absolute library path on stdout. After retention, output errors or signals leave the library, marker, and any known side files available for inspection, including if cancellation precedes stdout publication. The early stderr announcement identifies that directory when stderr was available. Repeated or concurrent runs use separate directories and leave libraries in the current directory untouched.
+
+After inspection, copy the announced run-directory path into `metal_run_dir` below. Cleanup accepts trailing slashes and succeeds when a valid target is already absent. An empty, nonsymlink target can be removed with `rmdir` even if an interruption removed its marker. Nonempty targets require this recipe's exact marker and only regular, nonsymlink known files; all entries are checked before anything is deleted. A matching folder name alone does not establish ownership. Cleanup removes only the named files and uses `rmdir` to remove the empty directory; it never recurses.
 
 ```sh
 sh <<'METAL_CLEANUP'
@@ -152,23 +166,27 @@ esac
 [ -e "$metal_run_dir" ] || exit 0
 [ -d "$metal_run_dir" ] || metal_refuse_cleanup
 metal_run_dir="$(CDPATH= cd -P -- "$metal_run_dir" && pwd -P)"
+# Recover an empty target even if its marker was removed by interrupted cleanup.
+if rmdir -- "$metal_run_dir" 2>/dev/null; then exit 0; fi
 metal_marker="$metal_run_dir/.metal-diagnostic-run"
 [ -f "$metal_marker" ] && [ ! -L "$metal_marker" ] || metal_refuse_cleanup
 printf 'metal-diagnostic-v1\n' | cmp -s -- - "$metal_marker" || metal_refuse_cleanup
 for metal_entry in "$metal_run_dir"/* "$metal_run_dir"/.[!.]* "$metal_run_dir"/..?*; do
     [ -e "$metal_entry" ] || [ -L "$metal_entry" ] || continue
     case "${metal_entry##*/}" in
-        Shaders.air|Shaders.diagnostic.metallib|.metal-diagnostic-run)
+        Shaders.air|Shaders.d|Shaders.diagnostic.metallib|.DS_Store|.metal-diagnostic-run)
             [ -f "$metal_entry" ] && [ ! -L "$metal_entry" ] || metal_refuse_cleanup
             ;;
         *) metal_refuse_cleanup ;;
     esac
 done
 rm -f -- "$metal_run_dir/Shaders.air" "$metal_run_dir/Shaders.diagnostic.metallib" \
-    "$metal_marker"
+    "$metal_run_dir/Shaders.d" "$metal_run_dir/.DS_Store" "$metal_marker"
 rmdir -- "$metal_run_dir"
 METAL_CLEANUP
 ```
+
+For legacy runs created without a marker, or interrupted cleanup that leaves nonempty markerless directories, verify from your own run history that the selected absolute path belongs to your diagnostic. Inspect it with `ls -la -- "$metal_run_dir"` and check that the directory and every entry are nonsymlinks. Only regular `Shaders.air`, `Shaders.d`, `Shaders.diagnostic.metallib`, `.DS_Store`, and `.metal-diagnostic-run` files belong to this cleanup procedure. Unknown contents need individual review. After confirming provenance, names, and types, remove only those named files with `rm -f --` and then use `rmdir -- "$metal_run_dir"`; do not create a marker merely to bypass a refusal. An interrupted cleanup can still leave files added concurrently. Repeating cleanup accepts absent or empty valid targets; nonempty markerless leftovers need this inspected recovery.
 
 `metal -c` checks source compilation; `metallib` links the compiled source into a library. Neither creates or executes the app's render/compute pipeline. For an isolated diagnostic involving NaN/Inf or sensitivity to optimizations, compare with `-fno-fast-math` without changing the shipping configuration. Do not silently add `-Werror` or switch the system-wide Xcode selection.
 
@@ -202,4 +220,4 @@ For an existing programmatic capture path, use `MTLCaptureManager` with an `MTLC
 - [Apple: Debug GPU-side errors in Metal, WWDC20](https://developer.apple.com/videos/play/wwdc2020/10616/) — command-buffer encoder status and generated-source diagnostics.
 - [Apple: Capturing a Metal workload in Xcode](https://developer.apple.com/documentation/xcode/capturing-a-metal-workload-in-xcode) and [programmatically](https://developer.apple.com/documentation/xcode/capturing-a-metal-workload-programmatically) — target-scoped capture and its enablement.
 
-Sources reviewed 2026-10-13.
+Sources reviewed 2026-10-14.
