@@ -17,13 +17,16 @@ Here is a **macOS / MSL 3.1 example**, not a default for an arbitrary project. C
 ```sh
 sh <<'METAL_DIAGNOSTIC'
 set -eu
+metal_stderr() {
+    (trap '' PIPE; printf "$@") >&2 || :
+}
 metal_sdk="macosx"
 metal_language="metal3.1"
 
 metal_temp_root="${TMPDIR:-/tmp}"
 case "$metal_temp_root" in
     /*) ;;
-    *) printf 'Temporary root must be absolute: %s\n' "$metal_temp_root" >&2; exit 1 ;;
+    *) metal_stderr 'Temporary root must be absolute: %s\n' "$metal_temp_root"; exit 1 ;;
 esac
 metal_temp_root="$(CDPATH= cd -P -- "$metal_temp_root" && pwd -P)"
 if metal_project_root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
@@ -35,8 +38,8 @@ fi
 metal_project_root="$(CDPATH= cd -P -- "$metal_project_root" && pwd -P)"
 case "$metal_temp_root/" in
     "${metal_project_root%/}/"*)
-        printf 'Temporary root must be outside the %s (%s): %s\n' \
-            "$metal_boundary_name" "$metal_project_root" "$metal_temp_root" >&2
+        metal_stderr 'Temporary root must be outside the %s (%s): %s\n' \
+            "$metal_boundary_name" "$metal_project_root" "$metal_temp_root"
         exit 1
         ;;
 esac
@@ -69,8 +72,7 @@ metal_on_exit() {
     metal_abort_if_signalled
     trap - EXIT
     metal_cleanup || {
-        (trap '' PIPE; printf 'Refusing or unable to clean run directory: %s\n' \
-            "$metal_build_dir") >&2 || :
+        metal_stderr 'Refusing or unable to clean run directory: %s\n' "$metal_build_dir"
     }
     trap - INT TERM HUP
     metal_abort_if_signalled
@@ -91,8 +93,7 @@ metal_abort_if_signalled() {
     esac
     metal_keep_output="$metal_signal_keep_output"
     metal_cleanup || {
-        (trap '' PIPE; printf 'Refusing or unable to clean run directory: %s\n' \
-            "$metal_build_dir") >&2 || :
+        metal_stderr 'Refusing or unable to clean run directory: %s\n' "$metal_build_dir"
     }
     trap - EXIT INT TERM HUP
     # Re-raise after the recording trap has returned, including on macOS sh.
@@ -108,7 +109,7 @@ metal_build_dir="$(trap '' INT TERM HUP; mktemp -d -- "$metal_temp_root/metal-di
 metal_abort_if_signalled
 printf 'metal-diagnostic-v1\n' > "$metal_build_dir/.metal-diagnostic-run"
 metal_abort_if_signalled
-(trap '' PIPE; printf 'Diagnostic run directory: %s\n' "$metal_build_dir") >&2 || :
+metal_stderr 'Diagnostic run directory: %s\n' "$metal_build_dir"
 metal_abort_if_signalled
 metal_library="$metal_build_dir/Shaders.diagnostic.metallib"
 xcrun --sdk "$metal_sdk" metal -std="$metal_language" \
@@ -127,24 +128,27 @@ metal_abort_if_signalled
 METAL_DIAGNOSTIC
 ```
 
-Keep the closing `METAL_DIAGNOSTIC` and `METAL_CLEANUP` delimiters unindented when inserting these blocks into a function or conditional; leading spaces prevent the shell from recognizing a heredoc delimiter.
+Keep the closing `METAL_DIAGNOSTIC`, `METAL_CLEANUP`, and `METAL_INSPECT` delimiters unindented when inserting these blocks into a function or conditional; leading spaces prevent the shell from recognizing a heredoc delimiter.
 
 Each run launches a separate `sh` process and creates a private, unique directory under the physical path of `${TMPDIR:-/tmp}`. Relative temporary roots are refused. The boundary is the Git project root when available, otherwise the working directory; roots equal to or inside that boundary are refused. Without a discoverable Git root, run from the project root: the recipe cannot identify a non-Git project's ancestor root from a subdirectory. Running from the temporary root itself also fails this check because it equals the working-directory boundary. Keep diagnostic outputs temporary and outside source/resource trees; never commit them.
 
 The marker `.metal-diagnostic-run` identifies this recipe's directories. Signal traps record INT, TERM, and HUP requests; cleanup and re-raising happen at command boundaries after the recording trap returns. The allocating child ignores those signals until it returns its directory path, so pending cancellation can remove the allocated directory. The diagnostic process then terminates by the original signal. This preserves bash's Ctrl-C behavior when a terminal interrupt reaches both the caller and diagnostic process.
 
-After allocation and marker creation, stderr announces `Diagnostic run directory: <absolute path>` before compilation. This annotation is best-effort: a closed descriptor or broken pipe does not fail the build or add text to stdout. Before retention, command failures and handled interruptions remove only known outputs and the empty run directory. Known files include regular, nonsymlink `.DS_Store` metadata and `Shaders.d` dependency output produced by an added `-MD` flag. Other entries or symlinks cause cleanup to refuse the directory.
+After allocation and marker creation, stderr announces `Diagnostic run directory: <absolute path>` before compilation. This annotation is best-effort: a closed descriptor or broken pipe does not fail the build or add text to stdout. Before retention, command failures and handled interruptions remove only known outputs and the empty run directory. Automatic cleanup uses the allocation returned by this process's own `mktemp` call, including cancellation before the marker is created. Known files include regular, nonsymlink `.DS_Store` metadata and `Shaders.d` dependency output produced by an added `-MD` flag. Other entries or symlinks cause cleanup to refuse the directory.
 
 Successful runs remove `Shaders.air`, commit retention, then print one absolute library path on stdout. After retention, output errors or signals leave the library, marker, and any known side files available for inspection, including if cancellation precedes stdout publication. The early stderr announcement identifies that directory when stderr was available. Repeated or concurrent runs use separate directories and leave libraries in the current directory untouched.
 
-After inspection, copy the announced run-directory path into `metal_run_dir` below. Cleanup accepts trailing slashes and succeeds when a valid target is already absent. An empty, nonsymlink target can be removed with `rmdir` even if an interruption removed its marker. Nonempty targets require this recipe's exact marker and only regular, nonsymlink known files; all entries are checked before anything is deleted. A matching folder name alone does not establish ownership. Cleanup removes only the named files and uses `rmdir` to remove the empty directory; it never recurses.
+After inspection, copy the announced run-directory path into `metal_run_dir` below. Cleanup accepts trailing slashes and succeeds when a valid target is already absent. Every existing target, including an empty directory, requires this recipe's exact regular, nonsymlink marker and only regular, nonsymlink known files; all entries are checked before anything is deleted. A matching folder name alone does not establish ownership. Cleanup removes only the named files and uses `rmdir` to remove the empty directory; it never recurses.
 
 ```sh
 sh <<'METAL_CLEANUP'
 set -eu
+metal_stderr() {
+    (trap '' PIPE; printf "$@") >&2 || :
+}
 metal_run_dir="/absolute/path/to/metal-diagnostic.XXXXXX"
 metal_refuse_cleanup() {
-    printf 'Refusing cleanup of run directory: %s\n' "$metal_run_dir" >&2
+    metal_stderr 'Refusing cleanup of run directory: %s\n' "$metal_run_dir"
     exit 1
 }
 while [ "${metal_run_dir%/}" != "$metal_run_dir" ]; do
@@ -166,8 +170,6 @@ esac
 [ -e "$metal_run_dir" ] || exit 0
 [ -d "$metal_run_dir" ] || metal_refuse_cleanup
 metal_run_dir="$(CDPATH= cd -P -- "$metal_run_dir" && pwd -P)"
-# Recover an empty target even if its marker was removed by interrupted cleanup.
-if rmdir -- "$metal_run_dir" 2>/dev/null; then exit 0; fi
 metal_marker="$metal_run_dir/.metal-diagnostic-run"
 [ -f "$metal_marker" ] && [ ! -L "$metal_marker" ] || metal_refuse_cleanup
 printf 'metal-diagnostic-v1\n' | cmp -s -- - "$metal_marker" || metal_refuse_cleanup
@@ -186,7 +188,25 @@ rmdir -- "$metal_run_dir"
 METAL_CLEANUP
 ```
 
-For legacy runs created without a marker, or interrupted cleanup that leaves nonempty markerless directories, verify from your own run history that the selected absolute path belongs to your diagnostic. Inspect it with `ls -la -- "$metal_run_dir"` and check that the directory and every entry are nonsymlinks. Only regular `Shaders.air`, `Shaders.d`, `Shaders.diagnostic.metallib`, `.DS_Store`, and `.metal-diagnostic-run` files belong to this cleanup procedure. Unknown contents need individual review. After confirming provenance, names, and types, remove only those named files with `rm -f --` and then use `rmdir -- "$metal_run_dir"`; do not create a marker merely to bypass a refusal. An interrupted cleanup can still leave files added concurrently. Repeating cleanup accepts absent or empty valid targets; nonempty markerless leftovers need this inspected recovery.
+Legacy runs created without a marker and interrupted cleanup can leave markerless directories, including empty ones. Normal cleanup refuses every existing markerless target. Recovery is operator-managed: select the path explicitly, inspect its directory metadata and entries, and compare them with your own run history before deciding how to handle it. This separate example only lists the selected path; it does not delete anything or establish ownership.
+
+```sh
+sh <<'METAL_INSPECT'
+set -eu
+metal_stderr() {
+    (trap '' PIPE; printf "$@") >&2 || :
+}
+metal_inspect_dir="/absolute/path/to/metal-diagnostic.XXXXXX"
+case "${metal_inspect_dir:-}" in
+    /*) ;;
+    *) metal_stderr 'Inspection path must be absolute and nonempty\n'; exit 1 ;;
+esac
+ls -ld -- "$metal_inspect_dir"
+ls -la -- "$metal_inspect_dir"
+METAL_INSPECT
+```
+
+An interruption or concurrent file creation between removing the marker and `rmdir` can leave a target that normal cleanup will refuse. Repeating cleanup succeeds for an already-absent valid target; existing markerless leftovers need the inspection above and operator-managed recovery.
 
 `metal -c` checks source compilation; `metallib` links the compiled source into a library. Neither creates or executes the app's render/compute pipeline. For an isolated diagnostic involving NaN/Inf or sensitivity to optimizations, compare with `-fno-fast-math` without changing the shipping configuration. Do not silently add `-Werror` or switch the system-wide Xcode selection.
 
