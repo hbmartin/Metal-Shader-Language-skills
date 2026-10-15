@@ -1,10 +1,11 @@
 """Execute the documented examples with temporary fixtures and bounded signal probes."""
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import json
 import os
 from pathlib import Path
 import re
+import select
 import shlex
 import shutil
 import signal
@@ -14,6 +15,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -58,19 +60,36 @@ def cleanup_example(directory, path=DIAGNOSTIC_REFERENCES[0]):
     return example.replace(assignment, "metal_run_dir=" + shlex.quote(str(directory)))
 
 
-def snapshot(directory):
+def inspection_example(directory, path=DIAGNOSTIC_REFERENCES[0]):
+    example = block(path, "sh", "sh <<'METAL_INSPECT'")
+    assignment = 'metal_inspect_dir="/absolute/path/to/metal-diagnostic.XXXXXX"'
+    if example.count(assignment) != 1:
+        raise AssertionError("Inspection input assignment is missing or ambiguous")
+    replacement = ("unset metal_inspect_dir" if directory is None
+                   else "metal_inspect_dir=" + shlex.quote(str(directory)))
+    return example.replace(assignment, replacement)
+
+
+def ordinary_finder_metadata(entry):
+    return entry.name == ".DS_Store" and entry.is_file() and not entry.is_symlink()
+
+
+def snapshot(directory, ignore_metadata=False):
     result = {}
     for entry in sorted(directory.iterdir()):
-        # Finder metadata is incidental; dedicated tests inspect it explicitly.
-        if entry.name == ".DS_Store" and entry.is_file() and not entry.is_symlink():
+        if ignore_metadata and ordinary_finder_metadata(entry):
             continue
         if entry.is_symlink():
             result[entry.name] = ("symlink", os.readlink(entry))
         elif entry.is_dir():
-            result[entry.name] = ("directory", snapshot(entry))
+            result[entry.name] = ("directory", snapshot(entry, ignore_metadata=ignore_metadata))
         else:
             result[entry.name] = ("file", entry.read_bytes())
     return result
+
+
+def allocation_records(log):
+    return [Path(line) for line in log.read_text().splitlines()] if log.exists() else []
 
 
 # This executable doubles as mktemp, xcrun, and an injected publication probe.
@@ -158,27 +177,35 @@ class ConsistencyTests(unittest.TestCase):
             block(DIAGNOSTIC_REFERENCES[0], "sh", "sh <<'METAL_CLEANUP'"),
             block(DIAGNOSTIC_REFERENCES[1], "sh", "sh <<'METAL_CLEANUP'"),
         )
+        self.assertEqual(
+            block(DIAGNOSTIC_REFERENCES[0], "sh", "sh <<'METAL_INSPECT'"),
+            block(DIAGNOSTIC_REFERENCES[1], "sh", "sh <<'METAL_INSPECT'"),
+        )
 
 
 @unittest.skipUnless(os.name == "posix" and CALLERS, "requires POSIX shells")
 class DiagnosticTests(unittest.TestCase):
     @contextmanager
-    def fixture(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="metal-reference-tests-", dir="/tmp")
-        self.addCleanup(self.temp.cleanup)
-        try:
-            self.base = Path(self.temp.name).resolve()
+    def fixture(self, rmdir_probe=False):
+        with ExitStack() as resources:
+            self.resources = resources
+            fixture_dir = resources.enter_context(
+                tempfile.TemporaryDirectory(prefix="metal-reference-tests-", dir="/tmp"))
+            self.base = Path(fixture_dir).resolve()
             self.project = self.base / "project with spaces"
             self.project.mkdir()
             (self.project / "Shaders.metal").write_text(SHADER)
             (self.project / "Shaders.diagnostic.metallib").write_bytes(b"project sentinel")
-            self.original_project = snapshot(self.project)
+            self.original_project = snapshot(self.project, ignore_metadata=True)
             self.outputs = self.base / "temporary outputs"
             self.outputs.mkdir()
             (self.outputs / ".DS_Store").write_bytes(b"fixture metadata")
             self.bin = self.base / "bin"
             self.bin.mkdir()
-            for name in ("xcrun", "mktemp", "rmdir", "metal-test-gate"):
+            names = ("xcrun", "mktemp", "metal-test-gate")
+            if rmdir_probe:
+                names += ("rmdir",)
+            for name in names:
                 executable = self.bin / name
                 executable.write_text("#!" + sys.executable + "\n" + STUB)
                 executable.chmod(0o700)
@@ -193,40 +220,47 @@ class DiagnosticTests(unittest.TestCase):
                 METAL_TEST_READY=str(self.base / "ready"),
                 METAL_TEST_RELEASE=str(self.base / "release"),
             )
+            # Process callbacks are registered later and therefore run first.
+            resources.callback(self.remove_external_allocations,
+                               Path(self.env["METAL_TEST_ALLOCATIONS"]), self.base)
             yield
-        finally:
-            self.doCleanups()
+
+    @staticmethod
+    def remove_external_allocations(log, base):
+        for directory in allocation_records(log):
+            if base in directory.parents:
+                continue  # TemporaryDirectory owns these, including unlogged entries.
+            # Only the real fallback /tmp allocations can be outside this fixture.
+            if (directory.parent != Path("/tmp").resolve()
+                    or not re.fullmatch(r"metal-diagnostic\.[A-Za-z0-9]{6}", directory.name)):
+                raise AssertionError(f"Unexpected external test allocation: {directory}")
+            if directory.is_symlink():
+                directory.unlink()
+            elif directory.exists():
+                shutil.rmtree(directory)
 
     def run_example(self, example, caller=None, env=None, cwd=None):
-        return subprocess.run(
-            [caller or CALLERS[0], "-c", example], cwd=cwd or self.project,
-            env=env or self.env, capture_output=True, text=True, timeout=12,
-        )
+        process = self.start_example(example, caller or CALLERS[0], env or self.env, cwd=cwd)
+        stdout, stderr = self.finish(process, timeout=12)
+        return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
 
-    def start_example(self, example, caller, env, stderr=subprocess.PIPE):
+    def start_example(self, example, caller, env, stderr=subprocess.PIPE, cwd=None):
         process = subprocess.Popen(
-            [caller, "-c", example], cwd=self.project, env=env,
+            [caller, "-c", example], cwd=cwd or self.project, env=env,
             stdout=subprocess.PIPE, stderr=stderr, text=True,
             start_new_session=True,
         )
-        self.addCleanup(self.stop_process, process)
+        self.resources.callback(self.stop_process, process)
         return process
 
     @staticmethod
     def stop_process(process):
-        if process.poll() is None:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+        # Descendants can hold pipes open after the session leader has exited.
         try:
-            process.communicate(timeout=3)
-        except subprocess.TimeoutExpired:
-            # The caller may have exited while a descendant still holds a pipe.
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
             process.communicate(timeout=3)
         finally:
             for stream in (process.stdout, process.stderr):
@@ -234,15 +268,17 @@ class DiagnosticTests(unittest.TestCase):
                     stream.close()
 
     def allocations(self):
-        log = Path(self.env["METAL_TEST_ALLOCATIONS"])
-        return [Path(line) for line in log.read_text().splitlines()] if log.exists() else []
+        return allocation_records(Path(self.env["METAL_TEST_ALLOCATIONS"]))
 
-    def remaining_runs(self):
-        return [path for path in self.allocations() if path.exists() or path.is_symlink()]
+    def remaining_outputs(self):
+        remaining = {path for path in self.allocations() if path.exists() or path.is_symlink()}
+        remaining.update(entry for entry in self.outputs.iterdir()
+                         if not ordinary_finder_metadata(entry))
+        return sorted(remaining)
 
-    def finish(self, process):
+    def finish(self, process, timeout=8):
         try:
-            return process.communicate(timeout=8)
+            return process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
             output = process.communicate(timeout=3)
@@ -276,7 +312,7 @@ class DiagnosticTests(unittest.TestCase):
         }
         if dependencies:
             expected["Shaders.d"] = ("file", b"dependency")
-        self.assertEqual(snapshot(library.parent), expected)
+        self.assertEqual(snapshot(library.parent, ignore_metadata=True), expected)
         self.assertEqual(stat.S_IMODE(library.parent.stat().st_mode) & 0o077, 0)
         return library
 
@@ -297,7 +333,7 @@ class DiagnosticTests(unittest.TestCase):
                         self.assertEqual(self.run_example(cleanup, caller).returncode, 0)
                         self.assertEqual(self.run_example(cleanup, caller).returncode, 0)
                         self.assertFalse(library.parent.exists())
-                    self.assertEqual(snapshot(self.project), self.original_project)
+                    self.assertEqual(snapshot(self.project, ignore_metadata=True), self.original_project)
 
     def test_compile_and_link_failures_preserve_status(self):
         for caller in CALLERS:
@@ -308,8 +344,8 @@ class DiagnosticTests(unittest.TestCase):
                     result = self.run_example(build_example(), caller, env)
                     self.assertEqual(result.returncode, status, result.stderr)
                     self.assertEqual(result.stdout, "")
-                    self.assertEqual(self.remaining_runs(), [])
-                    self.assertEqual(snapshot(self.project), self.original_project)
+                    self.assertEqual(self.remaining_outputs(), [])
+                    self.assertEqual(snapshot(self.project, ignore_metadata=True), self.original_project)
 
     def test_concurrent_builds_use_separate_directories(self):
         for caller in CALLERS:
@@ -325,7 +361,7 @@ class DiagnosticTests(unittest.TestCase):
                 for library in libraries:
                     self.assertEqual(self.run_example(
                         cleanup_example(library.parent), caller).returncode, 0)
-                self.assertEqual(snapshot(self.project), self.original_project)
+                self.assertEqual(snapshot(self.project, ignore_metadata=True), self.original_project)
 
     def test_invalid_temporary_roots_allocate_nothing(self):
         for variant in ("relative", "leading-dash", "project", "nested", "alias"):
@@ -374,10 +410,10 @@ class DiagnosticTests(unittest.TestCase):
             env.pop("TMPDIR", None)
             result = self.run_example(build_example(), env=env)
             self.assertEqual(result.returncode, 42, result.stderr)
-            directory = Path(Path(self.env["METAL_TEST_ALLOCATIONS"]).read_text().strip())
+            directory, = self.allocations()
             self.assertEqual(directory.parent, Path("/tmp").resolve())
             self.assertFalse(directory.exists())
-            self.assertEqual(snapshot(self.project), self.original_project)
+            self.assertEqual(snapshot(self.project, ignore_metadata=True), self.original_project)
 
     def test_stderr_errors_do_not_invalidate_success(self):
         example = build_example().replace("sh <<", "sh 2>&- <<", 1)
@@ -411,7 +447,7 @@ class DiagnosticTests(unittest.TestCase):
                     else:
                         self.assertEqual(process.returncode, 42)
                         self.assertEqual(stdout, "")
-                        self.assertEqual(len(self.remaining_runs()),
+                        self.assertEqual(len(self.remaining_outputs()),
                                          1 if outcome == "refused-cleanup" else 0)
 
     def test_directory_is_announced_before_compilation_completes(self):
@@ -427,7 +463,7 @@ class DiagnosticTests(unittest.TestCase):
                 stdout, _ = self.finish(process)
                 self.assertEqual(process.returncode, 42)
                 self.assertEqual(stdout, "")
-                self.assertEqual(self.remaining_runs(), [])
+                self.assertEqual(self.remaining_outputs(), [])
 
     def test_stdout_error_retains_completed_outputs(self):
         with self.fixture():
@@ -435,9 +471,9 @@ class DiagnosticTests(unittest.TestCase):
             result = self.run_example(example)
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(result.stdout, "")
-            directories = self.remaining_runs()
+            directories = self.remaining_outputs()
             self.assertEqual(len(directories), 1)
-            self.assertEqual(snapshot(directories[0]), {
+            self.assertEqual(snapshot(directories[0], ignore_metadata=True), {
                 ".metal-diagnostic-run": ("file", MARKER),
                 "Shaders.diagnostic.metallib": ("file", b"library"),
             })
@@ -461,8 +497,8 @@ class DiagnosticTests(unittest.TestCase):
                         stdout, stderr = self.finish(process)
                         self.assertNotEqual(process.returncode, 0, stderr)
                         self.assertEqual(stdout.splitlines(), ["RUN 1"])
-                        self.assertEqual(self.remaining_runs(), [])
-                        self.assertEqual(snapshot(self.project), self.original_project)
+                        self.assertEqual(self.remaining_outputs(), [])
+                        self.assertEqual(snapshot(self.project, ignore_metadata=True), self.original_project)
 
     def test_diagnostic_process_really_terminates_by_signal(self):
         # These direct-process assertions independently prove signal re-raising;
@@ -478,7 +514,7 @@ class DiagnosticTests(unittest.TestCase):
                 self.release_probe()
                 self.finish(process)
                 self.assertEqual(process.returncode, -sig)
-                self.assertEqual(self.remaining_runs(), [])
+                self.assertEqual(self.remaining_outputs(), [])
 
     def test_signals_during_final_cleanup_preserve_signal_status(self):
         boundary = "    trap - INT TERM HUP\n"
@@ -499,7 +535,7 @@ class DiagnosticTests(unittest.TestCase):
                 self.release_probe()
                 self.finish(process)
                 self.assertEqual(process.returncode, -sig)
-                self.assertEqual(self.remaining_runs(), [])
+                self.assertEqual(self.remaining_outputs(), [])
 
     def test_publication_interrupts_retain_completed_library(self):
         publication = "printf '%s\\n' \"$metal_library\"\n"
@@ -519,7 +555,7 @@ class DiagnosticTests(unittest.TestCase):
                         self.release_probe()
                         stdout, stderr = self.finish(process)
                         self.assertNotEqual(process.returncode, 0)
-                        directories = self.remaining_runs()
+                        directories = self.remaining_outputs()
                         self.assertEqual(len(directories), 1)
                         library = directories[0] / "Shaders.diagnostic.metallib"
                         self.assertEqual(library.read_bytes(), b"library")
@@ -639,7 +675,7 @@ class DiagnosticTests(unittest.TestCase):
                     else:
                         self.assertEqual(result.returncode, 42)
                         self.assertEqual(result.stdout, "")
-                    self.assertEqual(self.remaining_runs(), [])
+                    self.assertEqual(self.remaining_outputs(), [])
 
     def test_known_side_files_must_be_regular(self):
         for name in (".DS_Store", "Shaders.d"):
@@ -651,19 +687,31 @@ class DiagnosticTests(unittest.TestCase):
                 self.assertEqual(self.run_example(cleanup_example(directory)).returncode, 1)
                 self.assertEqual(snapshot(directory), before)
 
-    def test_empty_markerless_cleanup_and_repetition(self):
+    def test_empty_unrelated_targets_are_preserved(self):
         for caller in CALLERS:
             with self.subTest(caller=caller), self.fixture():
-                directory = self.outputs / "metal-diagnostic.abc123"
-                directory.mkdir()
+                directory = self.base / "outside temporary root" / "metal-diagnostic.backup"
+                directory.mkdir(parents=True, mode=0o750)
+                mode = stat.S_IMODE(directory.stat().st_mode)
                 for _ in range(2):
                     self.assertEqual(self.run_example(
-                        cleanup_example(str(directory) + "///"), caller).returncode, 0)
-                    self.assertFalse(directory.exists())
+                        cleanup_example(str(directory) + "///"), caller).returncode, 1)
+                    self.assertTrue(directory.is_dir())
+                    self.assertEqual(stat.S_IMODE(directory.stat().st_mode), mode)
+                    self.assertEqual(snapshot(directory), {})
 
-    def test_interrupted_cleanup_recovers_empty_target(self):
+    def test_marked_directory_without_library_and_absent_target_cleanup(self):
+        with self.fixture():
+            directory = self.outputs / "metal-diagnostic.abc123"
+            directory.mkdir()
+            (directory / ".metal-diagnostic-run").write_bytes(MARKER)
+            for _ in range(2):
+                self.assertEqual(self.run_example(cleanup_example(directory)).returncode, 0)
+                self.assertFalse(directory.exists())
+
+    def test_interrupted_cleanup_refuses_empty_markerless_target(self):
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-            with self.subTest(signal=sig.name), self.fixture():
+            with self.subTest(signal=sig.name), self.fixture(rmdir_probe=True):
                 directory = self.make_run()
                 process = self.start_example(cleanup_example(directory), CALLERS[0],
                                              dict(self.env, METAL_TEST_GATE="rmdir"))
@@ -675,11 +723,12 @@ class DiagnosticTests(unittest.TestCase):
                 self.assertNotEqual(process.returncode, 0)
                 self.assertTrue(directory.is_dir())
                 self.assertEqual(snapshot(directory), {})
-                self.assertEqual(self.run_example(cleanup_example(directory)).returncode, 0)
-                self.assertFalse(directory.exists())
+                self.assertEqual(self.run_example(cleanup_example(directory)).returncode, 1)
+                self.assertTrue(directory.is_dir())
+                self.assertEqual(snapshot(directory), {})
 
     def test_late_metadata_after_marker_removal_requires_inspected_recovery(self):
-        with self.fixture():
+        with self.fixture(rmdir_probe=True):
             directory = self.make_run()
             first = self.run_example(cleanup_example(directory),
                                      env=dict(self.env, METAL_TEST_LATE_METADATA="1"))
@@ -690,6 +739,153 @@ class DiagnosticTests(unittest.TestCase):
             self.assertEqual(metadata.read_bytes(), b"late metadata")
             self.assertEqual(self.run_example(cleanup_example(directory)).returncode, 1)
             self.assertEqual(metadata.read_bytes(), b"late metadata")
+
+    def test_inspection_is_self_contained_and_read_only(self):
+        for reference in DIAGNOSTIC_REFERENCES:
+            with self.subTest(reference=reference.name), self.fixture():
+                directory = self.make_run(marker=None)
+                (directory / ".DS_Store").write_bytes(b"metadata")
+                (directory / "notes").write_bytes(b"operator must inspect this")
+                before = snapshot(directory)
+                env = dict(self.env)
+                env.pop("metal_run_dir", None)
+                result = self.run_example(inspection_example(directory, reference), env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(str(directory), result.stdout)
+                self.assertIn("notes", result.stdout)
+                self.assertIn(".DS_Store", result.stdout)
+                self.assertEqual(snapshot(directory), before)
+                self.assertEqual(self.run_example(cleanup_example(directory)).returncode, 1)
+
+    def test_refusal_status_survives_stderr_errors(self):
+        cases = ("relative-root", "boundary-root", "manual-refusal",
+                 "inspection-unset", "inspection-empty", "inspection-relative")
+        for caller in CALLERS:
+            for stream in ("closed", "broken-pipe"):
+                for case in cases:
+                    with self.subTest(caller=caller, stream=stream, case=case), self.fixture():
+                        env = dict(self.env)
+                        if case == "relative-root":
+                            example = build_example()
+                            env["TMPDIR"] = "relative"
+                        elif case == "boundary-root":
+                            example = build_example()
+                            env["TMPDIR"] = str(self.project)
+                        elif case == "manual-refusal":
+                            directory = self.make_run(marker=None)
+                            example = cleanup_example(directory)
+                        else:
+                            value = {"inspection-unset": None, "inspection-empty": "",
+                                     "inspection-relative": "relative"}[case]
+                            example = inspection_example(value)
+                        if stream == "closed":
+                            example = example.replace("sh <<", "sh 2>&- <<", 1)
+                            result = self.run_example(example, caller, env)
+                        else:
+                            reader, writer = os.pipe()
+                            os.close(reader)
+                            try:
+                                process = self.start_example(example, caller, env, stderr=writer)
+                            finally:
+                                os.close(writer)
+                            stdout, _ = self.finish(process)
+                            result = subprocess.CompletedProcess([], process.returncode, stdout, "")
+                        self.assertEqual(result.returncode, 1, result.stderr)
+                        self.assertEqual(result.stdout, "")
+
+    def test_native_cleanup_errors_remain_visible(self):
+        if os.geteuid() == 0:
+            self.skipTest("root can bypass directory permissions")
+        with self.fixture():
+            directory = self.make_run()
+            self.outputs.chmod(0o500)
+            try:
+                result = self.run_example(cleanup_example(directory))
+            finally:
+                self.outputs.chmod(0o700)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(str(directory), result.stderr)
+            self.assertNotIn("Refusing cleanup", result.stderr)
+            self.assertFalse((directory / ".metal-diagnostic-run").exists())
+
+    def test_leak_inventory_sees_unlogged_entries(self):
+        with self.fixture():
+            stray = self.outputs / "stray file"
+            stray.write_bytes(b"unlogged output")
+            directory = self.outputs / "unlogged directory"
+            directory.mkdir()
+            self.assertEqual(self.allocations(), [])
+            self.assertEqual(set(self.remaining_outputs()), {stray, directory})
+            metadata = self.outputs / ".DS_Store"
+            metadata.unlink()
+            metadata.symlink_to(stray)
+            self.assertIn(metadata, self.remaining_outputs())
+
+    def test_snapshot_metadata_filter_is_explicit(self):
+        with self.fixture():
+            directory = self.make_run()
+            metadata = directory / ".DS_Store"
+            metadata.write_bytes(b"before")
+            exact_before = snapshot(directory)
+            incidental_before = snapshot(directory, ignore_metadata=True)
+            metadata.write_bytes(b"after")
+            self.assertNotEqual(snapshot(directory), exact_before)
+            self.assertEqual(snapshot(directory, ignore_metadata=True), incidental_before)
+            metadata.unlink()
+            metadata.symlink_to(directory / "Shaders.diagnostic.metallib")
+            self.assertEqual(snapshot(directory, ignore_metadata=True)[".DS_Store"][0], "symlink")
+
+    def test_fallback_allocations_are_removed_after_fixture_failure(self):
+        # A separate, unrecorded temporary directory is outside the fixture's ownership.
+        with tempfile.TemporaryDirectory(prefix="metal-diagnostic.", dir="/tmp") as unrelated:
+            sentinel = Path(unrelated) / "keep"
+            sentinel.write_bytes(b"unrelated")
+            with self.assertRaisesRegex(RuntimeError, "injected failure"):
+                with self.fixture():
+                    env = dict(self.env, METAL_TEST_FAIL="metal", METAL_TEST_INJECT="unexpected")
+                    env.pop("TMPDIR", None)
+                    result = self.run_example(build_example(), env=env)
+                    self.assertEqual(result.returncode, 42)
+                    directory, = self.allocations()
+                    self.assertEqual(directory.parent, Path("/tmp").resolve())
+                    self.assertTrue(directory.exists())
+                    raise RuntimeError("injected failure")
+            self.assertFalse(directory.exists())
+            self.assertEqual(sentinel.read_bytes(), b"unrelated")
+
+    def test_fixture_preserves_test_level_cleanup_scope(self):
+        events = []
+        self.addCleanup(events.append, "test cleanup")
+        with self.fixture():
+            events.append("fixture body")
+        self.assertEqual(events, ["fixture body"])
+
+    def test_exited_leader_descendants_are_stopped_before_draining_pipes(self):
+        with self.fixture():
+            code = ('import os,time\nfrom pathlib import Path\n'
+                    'if os.fork(): os._exit(0)\n'
+                    'Path(os.environ["METAL_TEST_READY"]).write_text(str(os.getpid()))\n'
+                    'time.sleep(30)\n')
+            process = self.start_example(code, sys.executable, self.env)
+            ready = Path(self.env["METAL_TEST_READY"])
+            deadline = time.monotonic() + 4
+            while not ready.exists():
+                if time.monotonic() > deadline:
+                    self.fail("Descendant did not reach the probe")
+                time.sleep(0.005)
+            self.assertEqual(process.wait(timeout=3), 0)
+            communicate = process.communicate
+
+            def drain_after_descendant_exit(*args, **kwargs):
+                # This child writes nothing. Readability therefore means EOF,
+                # proving it no longer holds stdout open before draining begins.
+                readable, _, _ = select.select([process.stdout], [], [], 2)
+                self.assertEqual(readable, [process.stdout], "Descendant still holds stdout open")
+                return communicate(*args, **kwargs)
+
+            with patch.object(process, "communicate", side_effect=drain_after_descendant_exit):
+                self.stop_process(process)
+            self.assertTrue(process.stdout.closed)
 
     def test_working_directory_boundary_without_git(self):
         for location in ("temporary-root", "project-root", "project-subdirectory"):
@@ -757,7 +953,7 @@ class DiagnosticTests(unittest.TestCase):
                     METAL_TEST_VICTIM=str(victim)))
                 self.assertEqual(result.returncode, 42)
                 self.assertIn("Refusing or unable to clean", result.stderr)
-                directories = self.remaining_runs()
+                directories = self.remaining_outputs()
                 self.assertEqual(len(directories), 1)
                 directory = directories[0]
                 self.assertEqual((directory / ".metal-diagnostic-run").read_bytes(), MARKER)
