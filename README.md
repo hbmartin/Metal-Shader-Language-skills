@@ -28,12 +28,12 @@ Background notes remain research inputs and are not redistributed as skill refer
 
 ## Verify reference examples
 
-Run the standard-library regression suite with Python 3.8 or newer, disabling bytecode output to keep the checkout clean:
+Run the standard-library regression suite with Python 3.13 or newer, disabling bytecode output to keep the checkout clean:
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests
 ```
 
-The suite extracts the documented examples, checks paired copies for consistency, and exercises temporary builds, guarded cleanup, read-only inspection, output publication, and cancellation from available bash, dash, and zsh callers. Compiler stubs make shell failures and signal timing reproducible; Xcode and SDKs are not required. Shell tests require POSIX `waitid(WNOWAIT)` and report an explicit skip where it is unavailable. Process-group tests simulate terminal cancellation, while separate diagnostic-process tests check termination by the original signal. Pipe readers drain output without reaping the leader; teardown stops its owned group before releasing that PID. Each shell subcase owns its cleanup resources and removes its recorded allocations, including fallback allocations outside the fixture directory. Leak checks combine allocation records with an independent output-directory inventory.
+The suite extracts the documented examples, checks paired copies for consistency, and exercises temporary builds, guarded cleanup, read-only inspection, output publication, and cancellation from available bash, dash, and zsh callers. Compiler stubs make shell failures and signal timing reproducible; Xcode and SDKs are not required. Older Python versions fail discovery with a version requirement. Process creation requires POSIX `waitid(WNOWAIT)` and reports an explicit skip where it is unavailable; bookkeeping tests still run. Process-group tests simulate terminal cancellation, while separate diagnostic-process tests check termination by the original signal. A constrained process wrapper owns pipe reading and reaping; teardown stops its owned group before releasing the leader PID. Secondary teardown failures are reported as notes without replacing the primary exception or its cause. Signal probes disable core dumps within the test process context and restore its resource limit afterward. Each shell subcase owns its cleanup resources and removes its recorded allocations, including fallback allocations outside the fixture directory. Leak checks combine allocation records with an independent output-directory inventory.
 
 When changing compiler flags, also perform a manual compile/link check with the available Metal toolchain; include `-MD` when validating dependency output and cleanup. Report unavailable tooling explicitly. All generated fixtures and diagnostic outputs stay in temporary directories outside the checkout and are never committed.
