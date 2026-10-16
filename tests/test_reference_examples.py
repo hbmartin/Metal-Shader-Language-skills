@@ -1,7 +1,6 @@
 """Execute the documented examples with temporary fixtures and bounded signal probes."""
 
 from contextlib import ExitStack, contextmanager
-import codecs
 import json
 import os
 from pathlib import Path
@@ -40,8 +39,38 @@ CALLERS = tuple(path for name in ("bash", "dash", "zsh") if (path := shutil.whic
 NONREAPING_WAIT = all(hasattr(os, name) for name in
                      ("waitid", "P_PID", "WEXITED", "WNOHANG", "WNOWAIT"))
 CANCELLATION_SIGNALS = tuple(getattr(signal, name) for name in
-                             ("SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT")
+                             ("SIGINT", "SIGTERM", "SIGHUP")
                              if hasattr(signal, name))
+
+
+def group_cancellation_signals():
+    if os.environ.get("METAL_TEST_GROUP_QUIT") == "1" and hasattr(signal, "SIGQUIT"):
+        return (*CANCELLATION_SIGNALS, signal.SIGQUIT)
+    return CANCELLATION_SIGNALS
+
+
+def heredoc_body(example, delimiter):
+    return example.split("\n", 1)[1].rsplit(delimiter + "\n", 1)[0]
+
+
+def caller_loop(example, checked_status=False):
+    check = ('metal_test_status=$?\n'
+             '[ "$metal_test_status" -eq 0 ] || exit "$metal_test_status"\n'
+             if checked_status else "")
+    return ('for metal_test_run in 1 2 3; do\n'
+            'printf "RUN %s\\n" "$metal_test_run"\n' + example + check + "done\n")
+
+
+def failing_stop(process, message):
+    stop = process.stop
+
+    def fail():
+        stop()
+        raise RuntimeError(message)
+
+    return fail
+
+
 MARKER = b"metal-diagnostic-v1\n"
 SHADER = """#include <metal_stdlib>
 using namespace metal;
@@ -109,43 +138,67 @@ def allocation_records(log):
 def note_cleanup_failure(primary, cleanup_error):
     if cleanup_error is not primary:
         primary.add_note("Additional teardown failure:\n" + "".join(
-            traceback.format_exception(cleanup_error, chain=False)))
+            traceback.format_exception(cleanup_error)))
 
 
 class ProcessOwnershipError(RuntimeError):
     pass
 
 
+class ProcessTeardownError(RuntimeError):
+    def __init__(self, message, captured):
+        self.message = message
+        self.capture(captured)
+
+    def capture(self, captured):
+        self.output, self.stderr = captured
+        self.args = (f"{self.message}: {captured!r}",)
+
+
 class OwnedProcess:
     """Own capture and reaping; expose no competing Popen operations or pipe handles."""
 
     def __init__(self, args, *, cwd, env, stderr=subprocess.PIPE):
+        if isinstance(args, (str, bytes, os.PathLike)):
+            raise TypeError("OwnedProcess requires an argument sequence, not a scalar command")
         if not NONREAPING_WAIT:
             raise unittest.SkipTest("Process tests require POSIX waitid(WNOWAIT)")
-        self._process = subprocess.Popen(
-            args, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=stderr,
-            text=True, start_new_session=True)
-        self._streams = (self._process.stdout, self._process.stderr)
+        self._args = tuple(args)
+        self._streams = (None, None)
+        self._encodings = (None, None)
         self._chunks = [[], []]
         self._read_errors = []
         self._capture_lock = threading.Lock()
         self._reader_stop = threading.Event()
         self._readers = []
         self._returncode = None
-        self._ownership_error = None
-        self._stopped = False
-        for index, stream in enumerate(self._streams):
-            if stream is not None:
-                decoder = codecs.getincrementaldecoder(stream.encoding)(errors=stream.errors)
-                os.set_blocking(stream.fileno(), False)
-                reader = threading.Thread(target=self._read_pipe, args=(index, stream, decoder),
-                                          daemon=True)
-                self._readers.append(reader)
-                reader.start()
+        self._ownership_loss = None
+        self._reaped = False
+        self._capture_closed = False
+        self._process = subprocess.Popen(
+            self._args, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=stderr,
+            text=True, start_new_session=True)
+        self._streams = (self._process.stdout, self._process.stderr)
+        try:
+            self._encodings = tuple(stream.encoding if stream is not None else None
+                                    for stream in self._streams)
+            for index, stream in enumerate(self._streams):
+                if stream is not None:
+                    os.set_blocking(stream.fileno(), False)
+                    reader = threading.Thread(target=self._read_pipe, args=(index, stream),
+                                              daemon=True)
+                    reader.start()
+                    self._readers.append(reader)
+        except BaseException as error:
+            try:
+                self.stop()
+            except BaseException as cleanup_error:
+                note_cleanup_failure(error, cleanup_error)
+            raise
 
     @property
     def args(self):
-        return tuple(self._process.args)
+        return self._args
 
     @property
     def pid(self):
@@ -159,7 +212,7 @@ class OwnedProcess:
     def pipes_closed(self):
         return all(stream is None or stream.closed for stream in self._streams)
 
-    def _read_pipe(self, index, stream, decoder):
+    def _read_pipe(self, index, stream):
         try:
             while not self._reader_stop.is_set():
                 if not select.select([stream], [], [], 0.05)[0]:
@@ -168,36 +221,42 @@ class OwnedProcess:
                     chunk = os.read(stream.fileno(), 65536)
                 except BlockingIOError:
                     continue
-                text = decoder.decode(chunk, final=not chunk)
-                with self._capture_lock:
-                    self._chunks[index].append(text)
                 if not chunk:
                     return
+                with self._capture_lock:
+                    self._chunks[index].append(chunk)
         except Exception as error:
             with self._capture_lock:
                 self._read_errors.append(error)
 
     def output(self):
         with self._capture_lock:
-            captured = ["".join(chunks) for chunks in self._chunks]
+            captured = [b"".join(chunks) for chunks in self._chunks]
+        captured = [value.decode(encoding, errors="backslashreplace")
+                    if encoding is not None else None
+                    for value, encoding in zip(captured, self._encodings)]
         return tuple(text.replace("\r\n", "\n").replace("\r", "\n")
                      if stream is not None else None
                      for text, stream in zip(captured, self._streams))
 
     def exited(self):
-        if self._ownership_error is not None:
-            raise self._ownership_error
-        if self._stopped:
+        if self._ownership_loss is not None:
+            self._raise_ownership_loss()
+        if self._reaped:
             return True
+        if self._process.returncode is not None:
+            self._ownership_loss = ChildProcessError("Child was reaped outside its owner")
+            self._raise_ownership_loss()
         try:
-            if self._process.returncode is not None:
-                raise ChildProcessError("Child was reaped outside its owner")
             return os.waitid(os.P_PID, self.pid,
                              os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
         except ChildProcessError as error:
-            self._ownership_error = ProcessOwnershipError(
-                "Process ownership lost: child was reaped outside its owner")
-            raise self._ownership_error from error
+            self._ownership_loss = error
+            self._raise_ownership_loss()
+
+    def _raise_ownership_loss(self):
+        raise ProcessOwnershipError(
+            "Process ownership lost: child was reaped outside its owner") from self._ownership_loss
 
     def wait_for_exit(self, timeout):
         deadline = time.monotonic() + timeout
@@ -211,34 +270,63 @@ class OwnedProcess:
             reader.join(timeout=max(0, deadline - time.monotonic()))
         return all(not reader.is_alive() for reader in self._readers)
 
-    def stop(self):
-        if self._stopped:
+    def _close_capture(self):
+        if self._capture_closed:
             return
+        self._reader_stop.set()
+        readers_stopped = self._join_readers(time.monotonic() + 0.25)
+        with ExitStack() as closing:
+            for stream in self._streams:
+                if stream is not None:
+                    closing.callback(stream.close)
+        self._capture_closed = True
+        if not readers_stopped:
+            raise ProcessTeardownError("Capture readers did not stop", self.output())
+
+    def stop(self):
+        if self._reaped or (self._ownership_loss is not None and self._capture_closed):
+            self._close_capture()
+            return
+        primary_error = None
         try:
-            self.exited()  # Prove this is still our unreaped child before signaling its group.
+            exited = self.exited()  # Verify the unreaped leader still reserves this group ID.
             try:
                 os.killpg(self.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                if not exited and not self.exited():
+                    raise
                 pass  # macOS can return EPERM for a group containing only a zombie.
-            self._returncode = self._process.wait(timeout=3)
+            try:
+                self._returncode = self._process.wait(timeout=3)
+            except subprocess.TimeoutExpired as error:
+                raise ProcessTeardownError(
+                    "Process teardown exceeded bounded wait", self.output()) from error
+            self._reaped = True
             if not self._join_readers(time.monotonic() + 3):
-                raise AssertionError("Process pipes remained open after group teardown")
+                raise ProcessTeardownError(
+                    "Process pipes remained open after group teardown", self.output())
             if self._read_errors:
                 raise AssertionError(f"Process pipe reader failed: {self._read_errors!r}")
+        except BaseException as error:
+            primary_error = error
+            raise
         finally:
-            self._reader_stop.set()
-            self._join_readers(time.monotonic() + 0.25)
             try:
-                with ExitStack() as closing:
-                    for stream in self._streams:
-                        if stream is not None:
-                            closing.callback(stream.close)
-                    if self._ownership_error is not None and self._process.returncode is None:
-                        # Acknowledge ECHILD to Popen's resource tracking. Its fallback status
-                        # stays private: this owner still reports None and the ownership error.
+                try:
+                    self._close_capture()
+                finally:
+                    if self._ownership_loss is not None and self._process.returncode is None:
+                        # Acknowledge ECHILD privately; never publish Popen's fallback status.
                         self._process.wait(timeout=0)
+            except BaseException as cleanup_error:
+                if primary_error is None:
+                    raise
+                note_cleanup_failure(primary_error, cleanup_error)
             finally:
-                self._stopped = True
+                if isinstance(primary_error, ProcessTeardownError):
+                    primary_error.capture(self.output())
 
     def collect(self, timeout):
         deadline = time.monotonic() + timeout
@@ -299,6 +387,13 @@ def gate(phase):
     Path(os.environ["METAL_TEST_READY"]).write_text(str(os.getpid()))
     deadline = time.monotonic() + 6
     while not Path(os.environ["METAL_TEST_RELEASE"]).exists():
+        if Path(os.environ["METAL_TEST_CANCEL_SENT"]).exists():
+            ignored = {sig.name: signal.getsignal(sig) == signal.SIG_IGN for sig in
+                       (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)}
+            checkpoint = Path(os.environ["METAL_TEST_CHECKPOINT"])
+            pending = checkpoint.with_suffix(".pending")
+            pending.write_text(json.dumps(ignored))
+            pending.replace(checkpoint)
         if time.monotonic() > deadline:
             sys.exit(97)
         time.sleep(0.005)
@@ -411,6 +506,8 @@ class DiagnosticTests(unittest.TestCase):
                 METAL_TEST_CALLS=str(self.base / "compiler calls"),
                 METAL_TEST_READY=str(self.base / "ready"),
                 METAL_TEST_RELEASE=str(self.base / "release"),
+                METAL_TEST_CANCEL_SENT=str(self.base / "cancellation sent"),
+                METAL_TEST_CHECKPOINT=str(self.base / "deletion checkpoint"),
             )
             # Process callbacks are registered later and therefore run first.
             resources.callback(self.remove_external_allocations,
@@ -484,10 +581,10 @@ class DiagnosticTests(unittest.TestCase):
     def wait_ready(self, process):
         self.wait_for_file(process, Path(self.env["METAL_TEST_READY"]))
 
-    def wait_for_file(self, process, path, timeout=4):
+    def wait_for_file(self, process, path, timeout=4, *, allow_exited_leader=False):
         deadline = time.monotonic() + timeout
         while not path.exists():
-            if process.exited():
+            if process.exited() and not allow_exited_leader and not path.exists():
                 process.stop()
                 self.fail(f"Diagnostic exited before probe: {process.output()!r}")
             if time.monotonic() > deadline:
@@ -689,16 +786,10 @@ class DiagnosticTests(unittest.TestCase):
         # Bash SIGINT specifically detects a child that exits numerically instead.
         for caller in CALLERS:
             for phase in ("allocation", "metal", "metallib"):
-                for sig in CANCELLATION_SIGNALS:
+                for sig in group_cancellation_signals():
                     with self.subTest(caller=caller, phase=phase, signal=sig.name), self.fixture():
                         env = dict(self.env, METAL_TEST_GATE=phase)
-                        # zsh ignores QUIT itself; automation must check the child's status.
-                        checked_status = ('metal_test_status=$?\n'
-                                          '[ "$metal_test_status" -eq 0 ] || exit "$metal_test_status"\n'
-                                          if sig == signal.SIGQUIT else "")
-                        loop = ('for metal_test_run in 1 2 3; do\n'
-                                'printf "RUN %s\\n" "$metal_test_run"\n'
-                                + build_example() + checked_status + "done\n")
+                        loop = caller_loop(build_example(), checked_status=sig == signal.SIGQUIT)
                         process = self.start_example(loop, caller, env)
                         self.wait_ready(process)
                         os.killpg(process.pid, sig)
@@ -713,7 +804,7 @@ class DiagnosticTests(unittest.TestCase):
         # These direct-process assertions independently prove signal re-raising;
         # outer loops can terminate from the group signal without proving that.
         # Execute the extracted here-document body directly to inspect wait status.
-        body = build_example().split("\n", 1)[1].rsplit("METAL_DIAGNOSTIC\n", 1)[0]
+        body = heredoc_body(build_example(), "METAL_DIAGNOSTIC")
         for sig in CANCELLATION_SIGNALS:
             with self.subTest(signal=sig.name), self.fixture():
                 process = self.start_example(body, shutil.which("sh"),
@@ -725,14 +816,64 @@ class DiagnosticTests(unittest.TestCase):
                 self.assertEqual(process.returncode, -sig)
                 self.assertEqual(self.remaining_outputs(), [])
 
+    def test_controlled_quit_cleans_or_retains_output_and_exits_131(self):
+        for phase in ("allocation", "metal", "metallib", "exit-cleanup",
+                      "before-publication", "after-publication"):
+            with self.subTest(phase=phase), self.fixture():
+                example = build_example()
+                env = dict(self.env, METAL_TEST_GATE=phase)
+                if phase == "exit-cleanup":
+                    boundary = "    trap - INT TERM HUP\n"
+                    example = example.replace(boundary,
+                        "    metal-test-gate exit-cleanup || :\n" + boundary, 1)
+                    env["METAL_TEST_FAIL"] = "metal"
+                retained = phase.endswith("publication")
+                if retained:
+                    publication = "printf '%s\\n' \"$metal_library\"\n"
+                    probe = f"metal-test-gate {phase}\n"
+                    if phase.startswith("before"):
+                        boundary = "metal_abort_if_signalled\n" + publication
+                        example = example.replace(boundary, probe + boundary)
+                    else:
+                        example = example.replace(publication, publication + probe)
+                process = self.start_example(heredoc_body(example, "METAL_DIAGNOSTIC"),
+                                             shutil.which("sh"), env)
+                self.wait_ready(process)
+                # The ready gate guarantees the diagnostic has installed its traps.
+                # Sending to its PID leaves unhandled compiler/caller processes alone.
+                os.kill(process.pid, signal.SIGQUIT)
+                self.release_probe()
+                stdout, stderr = self.finish(process)
+                self.assertEqual(process.returncode, 131, stderr)
+                if retained:
+                    directory, = self.remaining_outputs()
+                    library = directory / "Shaders.diagnostic.metallib"
+                    self.assertEqual(library.read_bytes(), b"library")
+                    self.assertEqual((directory / ".metal-diagnostic-run").read_bytes(), MARKER)
+                    self.assertIn("Diagnostic run directory: " + str(directory), stderr)
+                    self.assertEqual(stdout.splitlines(),
+                                     [str(library)] if phase.startswith("after") else [])
+                else:
+                    self.assertEqual(stdout, "")
+                    self.assertEqual(self.remaining_outputs(), [])
+                self.assertEqual(snapshot(self.project, ignore_metadata=True), self.original_project)
+
+    def test_group_quit_selection_requires_explicit_opt_in(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertNotIn(signal.SIGQUIT, group_cancellation_signals())
+            os.environ["METAL_TEST_GROUP_QUIT"] = "0"
+            self.assertNotIn(signal.SIGQUIT, group_cancellation_signals())
+            os.environ["METAL_TEST_GROUP_QUIT"] = "1"
+            self.assertEqual(group_cancellation_signals(), (*CANCELLATION_SIGNALS, signal.SIGQUIT))
+
     def test_signals_during_final_cleanup_preserve_signal_status(self):
-        boundary = "    trap - INT TERM HUP QUIT\n"
+        boundary = "    trap - INT TERM HUP\n"
         self.assertEqual(build_example().count(boundary), 1)
         # Cleanup runs in a conditional context: its failure must not trigger
         # errexit before the EXIT handler can honor a recorded signal.
         example = build_example().replace(
             boundary, "    metal-test-gate exit-cleanup || :\n" + boundary)
-        body = example.split("\n", 1)[1].rsplit("METAL_DIAGNOSTIC\n", 1)[0]
+        body = heredoc_body(example, "METAL_DIAGNOSTIC")
         for sig in CANCELLATION_SIGNALS:
             with self.subTest(signal=sig.name), self.fixture():
                 process = self.start_example(
@@ -751,7 +892,7 @@ class DiagnosticTests(unittest.TestCase):
         self.assertEqual(build_example().count(publication), 1)
         for caller in CALLERS:
             for position in ("before", "after"):
-                for sig in CANCELLATION_SIGNALS:
+                for sig in group_cancellation_signals():
                     with self.subTest(caller=caller, position=position, signal=sig.name), self.fixture():
                         probe = "metal-test-gate publication\n"
                         replacement = (probe + publication if position == "before"
@@ -921,17 +1062,12 @@ class DiagnosticTests(unittest.TestCase):
     def test_cleanup_defers_signals_until_directory_removed(self):
         for caller in CALLERS:
             for suffix in ("", "///"):
-                for sig in CANCELLATION_SIGNALS:
+                for sig in group_cancellation_signals():
                     with self.subTest(caller=caller, suffix=suffix, signal=sig.name), \
                             self.fixture(rmdir_probe=True):
                         directory = self.make_run()
-                        checked_status = ('metal_test_status=$?\n'
-                                          '[ "$metal_test_status" -eq 0 ] || exit "$metal_test_status"\n'
-                                          if sig == signal.SIGQUIT else "")
-                        loop = ('for metal_test_run in 1 2 3; do\n'
-                                'printf "RUN %s\\n" "$metal_test_run"\n'
-                                + cleanup_example(str(directory) + suffix)
-                                + checked_status + "done\n")
+                        loop = caller_loop(cleanup_example(str(directory) + suffix),
+                                           checked_status=sig == signal.SIGQUIT)
                         process = self.start_example(
                             loop, caller, dict(self.env, METAL_TEST_GATE="rmdir"))
                         self.wait_ready(process)
@@ -945,39 +1081,28 @@ class DiagnosticTests(unittest.TestCase):
                         self.assertEqual(self.run_example(
                             cleanup_example(str(directory) + suffix), caller).returncode, 0)
 
-    def test_manual_cleanup_really_terminates_by_signal_after_removal(self):
-        for sig in CANCELLATION_SIGNALS:
-            with self.subTest(signal=sig.name), self.fixture(rmdir_probe=True):
-                directory = self.make_run()
-                body = cleanup_example(directory).split("\n", 1)[1].rsplit(
-                    "METAL_CLEANUP\n", 1)[0]
-                process = self.start_example(body, shutil.which("sh"),
-                                             dict(self.env, METAL_TEST_GATE="rmdir"))
-                self.wait_ready(process)
-                os.killpg(process.pid, sig)
-                self.release_probe()
-                self.finish(process)
-                self.assertEqual(process.returncode, -sig)
-                self.assertFalse(directory.exists())
-
     def test_stalled_manual_deletion_defers_cancellation_until_released(self):
-        for sig in CANCELLATION_SIGNALS:
-            with self.subTest(signal=sig.name), self.fixture(rmdir_probe=True):
-                directory = self.make_run()
-                body = cleanup_example(directory).split("\n", 1)[1].rsplit(
-                    "METAL_CLEANUP\n", 1)[0]
-                process = self.start_example(body, shutil.which("sh"),
-                                             dict(self.env, METAL_TEST_GATE="rmdir"))
-                self.wait_ready(process)
-                os.killpg(process.pid, sig)
-                # The controlled deletion stays blocked until this test releases it.
-                time.sleep(0.05)
-                self.assertFalse(process.exited())
-                self.assertTrue(directory.is_dir())
-                self.release_probe()
-                self.finish(process)
-                self.assertEqual(process.returncode, -sig)
-                self.assertFalse(directory.exists())
+        for sig in (*CANCELLATION_SIGNALS, signal.SIGQUIT):
+            for suffix in ("", "///"):
+                with self.subTest(signal=sig.name, suffix=suffix), self.fixture(rmdir_probe=True):
+                    directory = self.make_run()
+                    body = heredoc_body(cleanup_example(str(directory) + suffix), "METAL_CLEANUP")
+                    process = self.start_example(body, shutil.which("sh"),
+                                                 dict(self.env, METAL_TEST_GATE="rmdir"))
+                    self.wait_ready(process)
+                    # QUIT targets only the trapped diagnostic PID in the default suite.
+                    (os.kill if sig == signal.SIGQUIT else os.killpg)(process.pid, sig)
+                    Path(self.env["METAL_TEST_CANCEL_SENT"]).touch()
+                    checkpoint = Path(self.env["METAL_TEST_CHECKPOINT"])
+                    self.wait_for_file(process, checkpoint)
+                    self.assertEqual(json.loads(checkpoint.read_text()),
+                                     {sig.name: True for sig in (*CANCELLATION_SIGNALS, signal.SIGQUIT)})
+                    self.assertFalse(process.exited())
+                    self.assertTrue(directory.is_dir())
+                    self.release_probe()
+                    self.finish(process)
+                    self.assertEqual(process.returncode, 131 if sig == signal.SIGQUIT else -sig)
+                    self.assertFalse(directory.exists())
 
     def test_uncatchable_cleanup_interrupt_refuses_empty_markerless_target(self):
         for caller in CALLERS:
@@ -1207,6 +1332,23 @@ class DiagnosticTests(unittest.TestCase):
             self.assertFalse(base.exists())
             self.assertIsNone(self.resources)
 
+    def test_fixture_preserves_all_secondary_cleanup_failures(self):
+        original_cause = KeyError("original cause sentinel")
+
+        def fail_cleanup(label):
+            raise RuntimeError(label)
+
+        with self.assertRaisesRegex(ValueError, "primary sentinel") as raised:
+            with self.fixture():
+                self.resources.callback(fail_cleanup, "cleanup sentinel one")
+                self.resources.callback(fail_cleanup, "cleanup sentinel two")
+                raise ValueError("primary sentinel") from original_cause
+        self.assertIs(raised.exception.__cause__, original_cause)
+        rendered = "".join(traceback.format_exception(raised.exception))
+        for expected in ("original cause sentinel", "cleanup sentinel one", "cleanup sentinel two"):
+            self.assertIn(expected, rendered)
+        self.assertIsNone(self.resources)
+
     def test_process_start_requires_an_active_fixture(self):
         case = DiagnosticTests("runTest")
         with patch.object(OwnedProcess, "__init__") as start:
@@ -1227,6 +1369,10 @@ class DiagnosticTests(unittest.TestCase):
             DiagnosticTests("test_snapshot_metadata_filter_is_explicit").run(result)
             self.assertEqual(result.testsRun, 1)
             self.assertEqual(result.skipped, [])
+            self.assertTrue(result.wasSuccessful(), (result.errors, result.failures))
+            result = unittest.TestResult()
+            DiagnosticTests("test_failed_subcase_cannot_contaminate_next_fixture").run(result)
+            self.assertEqual(len(result.skipped), 1)
             self.assertTrue(result.wasSuccessful(), (result.errors, result.failures))
             with self.fixture(), patch.object(subprocess, "Popen") as spawn:
                 with self.assertRaisesRegex(unittest.SkipTest, "waitid"):
@@ -1256,10 +1402,15 @@ class DiagnosticTests(unittest.TestCase):
         with self.fixture():
             code = ('import os,time\nfrom pathlib import Path\n'
                     'if os.fork(): os._exit(7)\n'
+                    'while not Path(os.environ["METAL_TEST_RELEASE"]).exists(): time.sleep(0.005)\n'
                     'Path(os.environ["METAL_TEST_READY"]).write_text(str(os.getpid()))\n'
                     'time.sleep(30)\n')
             process = self.start_example(code, sys.executable, self.env)
-            self.wait_for_file(process, Path(self.env["METAL_TEST_READY"]))
+            process.wait_for_exit(timeout=3)
+            self.assertFalse(Path(self.env["METAL_TEST_READY"]).exists())
+            self.release_probe()
+            self.wait_for_file(process, Path(self.env["METAL_TEST_READY"]),
+                               allow_exited_leader=True)
             process.wait_for_exit(timeout=3)
             self.assertIsNone(process.returncode)  # Keep the leader's PID reserved.
             self.assertTrue(any(reader.is_alive() for reader in process._readers))
@@ -1269,14 +1420,18 @@ class DiagnosticTests(unittest.TestCase):
             self.assertTrue(process.pipes_closed)
 
     def test_unreaped_process_teardown_closes_pipes_and_is_idempotent(self):
-        for error in (None, PermissionError("macOS zombie group"), ProcessLookupError()):
-            with self.subTest(group_error=type(error).__name__), self.fixture():
+        for error, exit_race in ((None, False), (PermissionError("macOS zombie group"), False),
+                                 (ProcessLookupError(), False), (PermissionError("zombie race"), True)):
+            with self.subTest(group_error=type(error).__name__, exit_race=exit_race), self.fixture():
                 process = self.start_example("import os; os._exit(7)", sys.executable, self.env)
                 process.wait_for_exit(timeout=3)
                 self.assertIsNone(process.returncode)
                 real_killpg = os.killpg
                 # Exercise the native macOS zombie behavior as well as deterministic errors.
-                with patch.object(os, "killpg", side_effect=error or real_killpg) as kill:
+                with ExitStack() as faults:
+                    if exit_race:
+                        faults.enter_context(patch.object(process, "exited", side_effect=[False, True]))
+                    kill = faults.enter_context(patch.object(os, "killpg", side_effect=error or real_killpg))
                     process.stop()
                     process.stop()
                     kill.assert_called_once_with(process.pid, signal.SIGKILL)
@@ -1309,6 +1464,106 @@ class DiagnosticTests(unittest.TestCase):
             self.assertEqual(process.returncode, -signal.SIGKILL)
             self.assertTrue(process.pipes_closed)
 
+    def test_scalar_commands_are_rejected_before_spawning(self):
+        for command in ("/usr/bin/true", b"/usr/bin/true", Path("/usr/bin/true")):
+            with self.subTest(command=command), patch.object(subprocess, "Popen") as spawn:
+                with self.assertRaisesRegex(TypeError, "argument sequence"):
+                    OwnedProcess(command, cwd="/tmp", env=os.environ.copy())
+                spawn.assert_not_called()
+
+    def test_reader_setup_failure_rolls_back_the_launched_process(self):
+        if not NONREAPING_WAIT:
+            self.skipTest("Process tests require POSIX waitid(WNOWAIT)")
+        for failure in ("blocking-mode", "second-reader", "rollback-note"):
+            with self.subTest(failure=failure), self.fixture():
+                process = OwnedProcess.__new__(OwnedProcess)
+                # Retain a fallback cleanup even if constructor rollback regresses.
+                self.resources.callback(process.stop)
+                cause = KeyError("setup original cause")
+
+                def fail_setup(*_):
+                    raise RuntimeError("reader setup sentinel") from cause
+
+                start_reader = threading.Thread.start
+                calls = 0
+
+                def fail_second_reader(reader):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        fail_setup()
+                    start_reader(reader)
+
+                with ExitStack() as faults:
+                    if failure == "second-reader":
+                        faults.enter_context(patch.object(threading.Thread, "start", fail_second_reader))
+                    else:
+                        faults.enter_context(patch.object(os, "set_blocking", side_effect=fail_setup))
+                    if failure == "rollback-note":
+                        faults.enter_context(patch.object(process, "stop", side_effect=failing_stop(
+                            process, "rollback cleanup sentinel")))
+                    with self.assertRaisesRegex(RuntimeError, "reader setup sentinel") as raised:
+                        process.__init__([sys.executable, "-c", "import time; time.sleep(30)"],
+                                         cwd=self.project, env=self.env)
+                self.assertIs(raised.exception.__cause__, cause)
+                if failure == "rollback-note":
+                    self.assertIn("rollback cleanup sentinel", "".join(raised.exception.__notes__))
+                self.assertEqual(process.returncode, -signal.SIGKILL)
+                self.assertTrue(process.pipes_closed)
+                self.assertTrue(all(not reader.is_alive() for reader in process._readers))
+                with patch.object(os, "killpg") as kill:
+                    process.stop()
+                    kill.assert_not_called()
+
+    def test_failed_stop_is_retryable_until_the_leader_is_reaped(self):
+        for failure in ("signal", "reap"):
+            with self.subTest(failure=failure), self.fixture():
+                code = ('import os,time\nfrom pathlib import Path\n'
+                        'Path(os.environ["METAL_TEST_READY"]).touch()\ntime.sleep(30)\n')
+                process = self.start_example(code, sys.executable, self.env)
+                self.wait_ready(process)
+                target, method = (os, "killpg") if failure == "signal" else (process._process, "wait")
+                with patch.object(target, method, side_effect=OSError("teardown fault sentinel")):
+                    with self.assertRaisesRegex(OSError, "teardown fault sentinel"):
+                        process.stop()
+                self.assertIsNone(process.returncode)
+                self.assertFalse(process._reaped)
+                self.assertTrue(process.pipes_closed)
+                if failure == "signal":
+                    self.assertFalse(process.exited())
+                process.stop()
+                self.assertEqual(process.returncode, -signal.SIGKILL)
+                self.assertTrue(process.exited())
+                with patch.object(os, "killpg") as kill:
+                    process.stop()
+                    kill.assert_not_called()
+
+    def test_teardown_timeout_keeps_output_and_is_not_a_diagnostic_timeout(self):
+        with self.fixture():
+            process = self.start_example(
+                'printf "stdout sentinel\\n"; printf "stderr sentinel\\n" >&2; exit 7',
+                CALLERS[0], self.env)
+            process.wait_for_exit(timeout=3)
+            self.assertTrue(process._join_readers(time.monotonic() + 3))
+            timeout = subprocess.TimeoutExpired(process.args, 3)
+            cause = KeyError("teardown timeout original cause")
+
+            def fail_wait(*_, **__):
+                raise timeout from cause
+
+            with patch.object(process._process, "wait", side_effect=fail_wait):
+                with self.assertRaisesRegex(ProcessTeardownError, "Process teardown exceeded") as raised:
+                    self.finish(process)
+            self.assertIs(raised.exception.__cause__, timeout)
+            self.assertIs(timeout.__cause__, cause)
+            self.assertEqual(raised.exception.output, "stdout sentinel\n")
+            self.assertEqual(raised.exception.stderr, "stderr sentinel\n")
+            self.assertNotIn("Diagnostic exceeded", str(raised.exception))
+            self.assertTrue(process.pipes_closed)
+            self.assertIsNone(process.returncode)
+            process.stop()
+            self.assertEqual(process.returncode, 7)
+
     def test_external_reaping_reports_ownership_loss_without_group_signals(self):
         for mode in ("raw-waitpid", "private-popen-wait"):
             with self.subTest(mode=mode), self.fixture():
@@ -1324,7 +1579,20 @@ class DiagnosticTests(unittest.TestCase):
                         process.exited()
                     with self.assertRaises(ProcessOwnershipError) as stopped:
                         process.stop()
-                    self.assertIs(stopped.exception, seen.exception)
+                    self.assertIsNot(stopped.exception, seen.exception)
+                    self.assertEqual(str(stopped.exception), str(seen.exception))
+                    depths, errors = [], []
+                    for _ in range(5):
+                        try:
+                            process.exited()
+                        except ProcessOwnershipError as error:
+                            errors.append(error)
+                            depths.append(len(traceback.extract_tb(error.__traceback__)))
+                            self.assertIs(error.__cause__, seen.exception.__cause__)
+                        else:
+                            self.fail("Ownership loss was not reported")
+                    self.assertEqual(len(set(depths)), 1)
+                    self.assertEqual(len({id(error) for error in errors}), len(errors))
                     process.stop()  # Teardown remains idempotent after reporting the failure.
                     kill.assert_not_called()
                 self.assertIsNone(process.returncode)
@@ -1337,12 +1605,6 @@ class DiagnosticTests(unittest.TestCase):
                     'Path(os.environ["METAL_TEST_READY"]).touch()\ntime.sleep(30)\n')
             process = self.start_example(code, sys.executable, self.env)
             self.wait_ready(process)
-            stop = process.stop
-
-            def failing_stop():
-                stop()  # Really stop the owned child before injecting the secondary failure.
-                raise RuntimeError("secondary teardown sentinel")
-
             original_cause = KeyError("original timeout cause")
             timeout = subprocess.TimeoutExpired(process.args, 0.01)
 
@@ -1350,7 +1612,7 @@ class DiagnosticTests(unittest.TestCase):
                 raise timeout from original_cause
 
             with patch.object(process, "wait_for_exit", side_effect=fail_wait), \
-                    patch.object(process, "stop", side_effect=failing_stop):
+                    patch.object(process, "stop", side_effect=failing_stop(process, "secondary teardown sentinel")):
                 with self.assertRaisesRegex(AssertionError, "Diagnostic exceeded bounded wait") as raised:
                     self.finish(process, timeout=0.01)
             self.assertIs(raised.exception.__cause__, timeout)
@@ -1366,13 +1628,8 @@ class DiagnosticTests(unittest.TestCase):
     def test_standalone_teardown_failure_remains_a_failure(self):
         with self.fixture():
             process = self.start_example("exit 0", CALLERS[0], self.env)
-            stop = process.stop
-
-            def failing_stop():
-                stop()
-                raise RuntimeError("standalone teardown sentinel")
-
-            with patch.object(process, "stop", side_effect=failing_stop):
+            with patch.object(process, "stop", side_effect=failing_stop(
+                    process, "standalone teardown sentinel")):
                 with self.assertRaisesRegex(RuntimeError, "standalone teardown sentinel"):
                     self.finish(process)
 
@@ -1387,6 +1644,42 @@ class DiagnosticTests(unittest.TestCase):
             self.assertIsNone(process.returncode)
             self.assertEqual(self.finish(process), ("x" * 131072, "y" * 131072))
             self.assertEqual(process.returncode, 0)
+
+    def test_invalid_output_bytes_do_not_stop_pipe_draining(self):
+        with self.fixture():
+            code = ('import os\nfrom pathlib import Path\n'
+                    'os.write(1,b"\\xff"+b"x"*262144+b"\\r\\n")\n'
+                    'os.write(2,b"\\xfe"+b"y"*262144+b"\\r")\n'
+                    'Path(os.environ["METAL_TEST_READY"]).touch()\n')
+            process = self.start_example(code, sys.executable, self.env)
+            self.wait_ready(process)
+            self.assertEqual(self.finish(process),
+                             ("\\xff" + "x" * 262144 + "\n", "\\xfe" + "y" * 262144 + "\n"))
+            self.assertEqual(process.returncode, 0)
+            self.assertEqual(process._read_errors, [])
+            self.assertTrue(process.pipes_closed)
+
+    def test_split_multibyte_output_with_uncaptured_stderr(self):
+        with self.fixture():
+            code = ('import os,time\nfrom pathlib import Path\n'
+                    'os.write(1,b"\\xe2")\n'
+                    'Path(os.environ["METAL_TEST_READY"]).touch()\n'
+                    'while not Path(os.environ["METAL_TEST_RELEASE"]).exists(): time.sleep(0.005)\n'
+                    'os.write(1,b"\\x98\\x83\\r\\n")\n')
+            process = self.start_example(code, sys.executable, self.env, stderr=subprocess.DEVNULL)
+            self.wait_ready(process)
+            self.release_probe()
+            self.assertEqual(self.finish(process), ("\u2603\n", None))
+            self.assertEqual(process.returncode, 0)
+            self.assertTrue(process.pipes_closed)
+
+    def test_readiness_still_rejects_an_unexpected_leader_exit(self):
+        with self.fixture():
+            process = self.start_example("exit 7", CALLERS[0], self.env)
+            with self.assertRaisesRegex(AssertionError, "Diagnostic exited before probe"):
+                self.wait_ready(process)
+            self.assertEqual(process.returncode, 7)
+            self.assertTrue(process.pipes_closed)
 
     def test_working_directory_boundary_without_git(self):
         for location in ("temporary-root", "project-root", "project-subdirectory"):
@@ -1418,6 +1711,8 @@ class DiagnosticTests(unittest.TestCase):
                     self.assertEqual(self.allocations(), [])
 
     def test_failed_subcase_cannot_contaminate_next_fixture(self):
+        if not NONREAPING_WAIT:
+            self.skipTest("Process tests require POSIX waitid(WNOWAIT)")
         bases, processes = [], []
 
         class FailingSubcases(DiagnosticTests):
