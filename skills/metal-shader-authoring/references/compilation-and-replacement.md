@@ -64,6 +64,7 @@ metal_on_exit() {
     metal_cleanup || {
         metal_stderr 'Refusing or unable to clean run directory: %s\n' "$metal_build_dir"
     }
+    trap '' QUIT
     trap - INT TERM HUP
     metal_abort_if_signalled
     exit "$metal_status"
@@ -86,12 +87,11 @@ metal_abort_if_signalled() {
     metal_cleanup || {
         metal_stderr 'Refusing or unable to clean run directory: %s\n' "$metal_build_dir"
     }
-    if [ "$metal_pending_signal" = QUIT ]; then
-        trap - EXIT INT TERM HUP
-        trap '' QUIT
-        exit 131
-    fi
-    trap - EXIT INT TERM HUP QUIT
+    trap '' QUIT
+    trap - EXIT INT TERM HUP
+    case "$metal_pending_signal" in
+        QUIT) exit "$metal_signal_status" ;;
+    esac
     # Re-raise after the recording trap has returned, including on macOS sh.
     kill -s "$metal_pending_signal" "$$"
     exit "$metal_signal_status"
@@ -129,7 +129,7 @@ Keep the closing `METAL_DIAGNOSTIC`, `METAL_CLEANUP`, and `METAL_INSPECT` delimi
 
 Each run launches a separate `sh` process and creates a private, unique directory under the physical path of `${TMPDIR:-/tmp}`. Relative temporary roots are refused. The boundary is the Git project root when available, otherwise the working directory; roots equal to or inside that boundary are refused. Without a discoverable Git root, run from the project root: the recipe cannot identify a non-Git project's ancestor root from a subdirectory. Running from the temporary root itself also fails this check because it equals the working-directory boundary. Keep diagnostic outputs temporary and outside source/resource trees; never commit them.
 
-The marker `.metal-diagnostic-run` identifies this recipe's directories. Signal traps record INT, TERM, HUP, and QUIT requests; cleanup and cancellation happen at command boundaries after the recording trap returns. The allocating child ignores those signals until it returns its directory path, so pending cancellation can remove the allocated directory. After cleanup, INT, TERM, and HUP terminate the diagnostic process by the original signal. This preserves bash's Ctrl-C behavior when a terminal interrupt reaches both the caller and diagnostic process. Handled QUIT exits numerically with status 131 instead of re-raising the signal, so this shell does not intentionally generate a core dump or crash report. Terminal-wide QUIT can still produce cores or OS crash reports from other foreground processes. Callers, including bash and zsh, may ignore QUIT themselves; automation that must stop after a diagnostic failure should check its exit status.
+The marker `.metal-diagnostic-run` identifies this recipe's directories. Signal traps record INT, TERM, HUP, and QUIT requests; cleanup and cancellation happen at command boundaries after the recording trap returns. The allocating child ignores those signals until it returns its directory path, so pending cancellation can remove the allocated directory. After cleanup, INT, TERM, and HUP terminate the diagnostic process by the original signal. This preserves bash's Ctrl-C behavior when a terminal interrupt reaches both the caller and diagnostic process. Handled QUIT exits numerically with status 131 instead of re-raising the signal, so this shell does not intentionally generate a core dump or crash report. Terminal-wide QUIT can still produce cores or OS crash reports from other foreground processes. Before its final cancellation decision, the shell ignores further QUIT; requests recorded before that boundary are honored, while later QUIT is ignored through exit, including when re-raising another signal. A QUIT disposition inherited as ignored cannot be trapped by a noninteractive shell. Callers, including bash and zsh, may ignore QUIT themselves; automation that must stop after a diagnostic failure should check its exit status.
 
 After allocation and marker creation, stderr announces `Diagnostic run directory: <absolute path>` before compilation. This annotation is best-effort: a closed descriptor or broken pipe does not fail the build or add text to stdout. Before retention, command failures and handled interruptions remove only known outputs and the empty run directory. Automatic cleanup uses the allocation returned by this process's own `mktemp` call, including cancellation before the marker is created. Known files include regular, nonsymlink `.DS_Store` metadata and `Shaders.d` dependency output produced by an added `-MD` flag. Other entries or symlinks cause cleanup to refuse the directory.
 
@@ -195,13 +195,10 @@ metal_cleanup_status=0
         "$metal_run_dir/Shaders.d" "$metal_run_dir/.DS_Store" "$metal_marker" &&
     rmdir -- "$metal_run_dir"
 ) || metal_cleanup_status=$?
-if [ "$metal_pending_signal" = QUIT ]; then
-    trap - INT TERM HUP
-    trap '' QUIT
-    exit 131
-fi
-trap - INT TERM HUP QUIT
+trap '' QUIT
+trap - INT TERM HUP
 case "$metal_pending_signal" in
+    QUIT) exit 131 ;;
     INT) kill -s INT "$$"; exit 130 ;;
     TERM) kill -s TERM "$$"; exit 143 ;;
     HUP) kill -s HUP "$$"; exit 129 ;;
@@ -241,7 +238,7 @@ ls -la -- "$metal_inspect_dir"
 METAL_INSPECT
 ```
 
-After validation, manual cleanup records INT, TERM, HUP, and QUIT while its deletion subprocess ignores them. It finishes the named-file removal and `rmdir`, then honors the first recorded request: INT, TERM, and HUP terminate it by that signal; QUIT exits numerically with status 131 without self-signaling. Without cancellation, cleanup preserves its command status and native error messages. This deferral has no deadline: if deletion stalls, these signals remain deferred until it returns. Operator force termination may be necessary; afterward, inspect the selected directory and use operator-managed recovery. Concurrent file creation, filesystem errors, or uncatchable termination can still leave a markerless target that normal cleanup will refuse. Repeating cleanup succeeds for an already-absent valid target; existing markerless leftovers need the inspection above and operator-managed recovery.
+After validation, manual cleanup records INT, TERM, HUP, and QUIT while its deletion subprocess ignores them. It finishes the named-file removal and `rmdir`, then honors the first recorded request: INT, TERM, and HUP terminate it by that signal; QUIT exits numerically with status 131 without self-signaling. After deletion returns, cleanup ignores further QUIT before reading the pending request and keeps QUIT ignored through exit; requests already recorded are honored. Without cancellation, cleanup preserves its command status and native error messages. This deferral has no deadline: if deletion stalls, these signals remain deferred until it returns. Operator force termination may be necessary; afterward, inspect the selected directory and use operator-managed recovery. Concurrent file creation, filesystem errors, or uncatchable termination can still leave a markerless target that normal cleanup will refuse. Repeating cleanup succeeds for an already-absent valid target; existing markerless leftovers need the inspection above and operator-managed recovery.
 
 `metal -c` checks source compilation; `metallib` links the compiled source into a library. Neither creates or executes the app's render/compute pipeline. Load or inspect the retained diagnostic library before removing it.
 
@@ -276,4 +273,4 @@ For arbitrary user-edited shader execution, use an application-appropriate bound
 - [Metal binary archives](https://developer.apple.com/documentation/metal/metal-binary-archives): pipeline compilation caches.
 - [Building with embedded shader sources](https://developer.apple.com/documentation/xcode/building-your-project-with-embedded-shader-sources): shader inspection builds.
 
-Sources reviewed 2026-10-16. Use the classic `MTLDevice`/pipeline path; newer Metal compiler/submission APIs are outside this collection.
+Sources reviewed 2026-10-17. Use the classic `MTLDevice`/pipeline path; newer Metal compiler/submission APIs are outside this collection.
